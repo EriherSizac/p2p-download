@@ -1,0 +1,21 @@
+{
+  "name": "p2p-download",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "P2P file sharing didáctico estilo BitTorrent. Solo módulos nativos de Node.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "build": "tsc -p .",
+    "start": "node dist/main.js",
+    "demo": "tsx scripts/demo.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}
