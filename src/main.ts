@@ -9,6 +9,7 @@
 
 import readline from 'node:readline';
 import path from 'node:path';
+import fs from 'node:fs';
 import { Discovery } from './discovery.js';
 import { Transport } from './transport.js';
 import {
@@ -52,6 +53,33 @@ async function bootstrap(): Promise<void> {
 
   const scheduler = new Scheduler(transport, index, DOWNLOAD_DIR, MANIFESTS_DIR);
   scheduler.start();
+
+  // Hot reindex: si el usuario añade/quita archivos en SHARED_DIR, los
+  // reindexamos. Debounce para evitar tormentas durante una copia masiva.
+  let reindexTimer: NodeJS.Timeout | undefined;
+  try {
+    fs.watch(SHARED_DIR, () => {
+      if (reindexTimer) clearTimeout(reindexTimer);
+      reindexTimer = setTimeout(() => {
+        void index.refresh().then(() => {
+          // Anunciar nuestro nuevo catálogo a los peers conectados sin
+          // re-crear peer-state (perderíamos bitfields remotos / in-flight).
+          for (const f of index.list()) {
+            const numBytes = Math.ceil(f.numPieces / 8);
+            const full = Buffer.alloc(numBytes);
+            for (let i = 0; i < f.numPieces; i++) full[i >> 3] = (full[i >> 3] ?? 0) | (1 << (7 - (i & 7)));
+            transport.broadcast({
+              type: MSG.HAVE,
+              fileId: f.fileId,
+              bitfield: full.toString('base64'),
+            });
+          }
+        });
+      }, 500);
+    });
+  } catch (err) {
+    log.warn('fs.watch no disponible:', (err as Error).message);
+  }
 
   const remoteCatalog = new Map<string, FileSummary[]>();
   const remoteManifests = new Map<string, FileManifest>(); // `${peerId}:${fileId}`
