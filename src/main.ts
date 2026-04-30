@@ -1,22 +1,27 @@
 /**
  * MAIN — orquestación de capas + CLI
  * ----------------------------------
- * Junta las capas (descubrimiento → transporte → protocolo → catálogo) y
- * expone una CLI sobre `readline`. Aquí no hay lógica de aplicación: solo
- * cableado entre componentes y traducción de comandos del usuario.
- *
- * 💡 Nota didáctica: separar la composición (este archivo) del comportamiento
- * (los módulos de capa) facilita los tests unitarios y deja una "vista de
- * pájaro" muy clara del sistema.
+ * Junta las capas (descubrimiento → transporte → protocolo → catálogo →
+ * scheduler) y expone una CLI sobre `readline`. Aquí no hay lógica de
+ * aplicación: solo cableado entre componentes y traducción de comandos del
+ * usuario en llamadas a las capas.
  */
 
 import readline from 'node:readline';
 import path from 'node:path';
 import { Discovery } from './discovery.js';
 import { Transport } from './transport.js';
-import { generatePeerId, shortId, MSG, type Message, type FileSummary, type FileManifest } from './protocol.js';
+import {
+  generatePeerId,
+  shortId,
+  MSG,
+  type Message,
+  type FileSummary,
+  type FileManifest,
+} from './protocol.js';
 import { createLogger } from './logger.js';
 import { FileIndex } from './index-files.js';
+import { Scheduler } from './scheduler.js';
 
 const log = createLogger('main');
 
@@ -45,23 +50,32 @@ async function bootstrap(): Promise<void> {
   const discovery = new Discovery({ peerId, tcpPort: actualPort, discoveryPort: DISCOVERY_PORT });
   await discovery.start();
 
-  // Catálogos remotos cacheados a medida que llegan LIST_REPLY/MANIFEST_REPLY.
-  const remoteCatalog = new Map<string, FileSummary[]>(); // peerId → archivos
-  const remoteManifests = new Map<string, FileManifest>(); // `${peerId}:${fileId}` → manifest
+  const scheduler = new Scheduler(transport, index, DOWNLOAD_DIR, MANIFESTS_DIR);
+  scheduler.start();
 
-  // Promesas pendientes de respuesta — se resuelven al recibir el reply.
+  const remoteCatalog = new Map<string, FileSummary[]>();
+  const remoteManifests = new Map<string, FileManifest>(); // `${peerId}:${fileId}`
+
   const pendingList = new Map<string, PendingResolver<FileSummary[]>>();
-  const pendingManifest = new Map<string, PendingResolver<FileManifest>>(); // key = `${peerId}:${fileId}`
+  const pendingManifest = new Map<string, PendingResolver<FileManifest>>();
 
-  // Conexiones automáticas con tie-break lexicográfico.
   discovery.on('peer-up', (p) => {
     if (peerId < p.peerId) {
       transport.connect(p.peerId, p.host, p.port);
     }
   });
 
+  transport.on('peer-connected', (id) => {
+    scheduler.onPeerConnected(id);
+  });
+  transport.on('peer-disconnected', (id) => {
+    scheduler.onPeerDisconnected(id);
+  });
+
   transport.on('message', (from, msg: Message) => {
     handleMessage(from, msg);
+    // El scheduler se interesa por HAVE/REQUEST/PIECE.
+    scheduler.handleMessage(from, msg);
   });
 
   function handleMessage(from: string, msg: Message): void {
@@ -85,7 +99,11 @@ async function bootstrap(): Promise<void> {
       case MSG.MANIFEST: {
         const entry = index.getByFileId(msg.fileId);
         if (!entry) {
-          transport.send(from, { type: MSG.ERROR, code: 'NOT_FOUND', message: `fileId ${msg.fileId.slice(0, 8)} no disponible` });
+          transport.send(from, {
+            type: MSG.ERROR,
+            code: 'NOT_FOUND',
+            message: `fileId ${shortId(msg.fileId)} no disponible`,
+          });
           return;
         }
         transport.send(from, { type: MSG.MANIFEST_REPLY, manifest: entry.manifest });
@@ -107,26 +125,44 @@ async function bootstrap(): Promise<void> {
         break;
       case MSG.CHAT:
         // TODO(ALUMNO): imprimir el chat sin romper el prompt de readline.
-        // Pista: process.stdout.write('\r…\n') + rl.prompt(true).
         log.info(`[chat][${shortId(from)}] ${msg.text}`);
         break;
       default:
-        log.debug(`msg tipo 0x${msg.type.toString(16)} de ${shortId(from)}`);
+        // HAVE/REQUEST/PIECE los maneja el scheduler.
+        break;
     }
   }
 
-  function requestList(targetPeer: string, timeoutMs = 3000): Promise<FileSummary[]> {
+  function requestList(target: string, timeoutMs = 3000): Promise<FileSummary[]> {
     return new Promise((resolve, reject) => {
-      if (!transport.isConnected(targetPeer)) {
+      if (!transport.isConnected(target)) {
         reject(new Error('peer no conectado'));
         return;
       }
       const timer = setTimeout(() => {
-        pendingList.delete(targetPeer);
+        pendingList.delete(target);
         reject(new Error('timeout esperando LIST_REPLY'));
       }, timeoutMs);
-      pendingList.set(targetPeer, { resolve, reject, timer });
-      transport.send(targetPeer, { type: MSG.LIST });
+      pendingList.set(target, { resolve, reject, timer });
+      transport.send(target, { type: MSG.LIST });
+    });
+  }
+
+  function requestManifest(target: string, fileId: string, timeoutMs = 5000): Promise<FileManifest> {
+    return new Promise((resolve, reject) => {
+      if (!transport.isConnected(target)) {
+        reject(new Error('peer no conectado'));
+        return;
+      }
+      const key = `${target}:${fileId}`;
+      const cached = remoteManifests.get(key);
+      if (cached) { resolve(cached); return; }
+      const timer = setTimeout(() => {
+        pendingManifest.delete(key);
+        reject(new Error('timeout esperando MANIFEST_REPLY'));
+      }, timeoutMs);
+      pendingManifest.set(key, { resolve, reject, timer });
+      transport.send(target, { type: MSG.MANIFEST, fileId });
     });
   }
 
@@ -134,13 +170,16 @@ async function bootstrap(): Promise<void> {
     discovery,
     transport,
     index,
+    scheduler,
     remoteCatalog,
     requestList,
+    requestManifest,
   });
 
   const shutdown = (): void => {
     log.info('cerrando…');
     transport.broadcast({ type: MSG.BYE });
+    scheduler.stop();
     discovery.stop();
     transport.stop();
     process.exit(0);
@@ -153,8 +192,10 @@ interface CliCtx {
   discovery: Discovery;
   transport: Transport;
   index: FileIndex;
+  scheduler: Scheduler;
   remoteCatalog: Map<string, FileSummary[]>;
   requestList: (peerId: string) => Promise<FileSummary[]>;
+  requestManifest: (peerId: string, fileId: string) => Promise<FileManifest>;
 }
 
 function setupCli(ctx: CliCtx): void {
@@ -166,12 +207,10 @@ function setupCli(ctx: CliCtx): void {
     process.stdout.write(s.endsWith('\n') ? s : s + '\n');
   };
 
-  /** Resuelve un prefijo de peerId al peerId completo si es único. */
   const resolvePeer = (prefix: string): string | undefined => {
     const all = ctx.discovery.list().map((p) => p.peerId);
     const matches = all.filter((id) => id.startsWith(prefix));
-    if (matches.length === 1) return matches[0];
-    return undefined;
+    return matches.length === 1 ? matches[0] : undefined;
   };
 
   rl.on('line', async (line) => {
@@ -182,13 +221,10 @@ function setupCli(ctx: CliCtx): void {
           break;
         case 'peers': {
           const list = ctx.discovery.list();
-          if (list.length === 0) {
-            out('(no hay peers descubiertos)');
-          } else {
-            for (const p of list) {
-              const conn = ctx.transport.isConnected(p.peerId) ? 'conectado' : 'descubierto';
-              out(`  ${shortId(p.peerId)}  ${p.host}:${p.port}  ${conn}`);
-            }
+          if (list.length === 0) { out('(no hay peers descubiertos)'); break; }
+          for (const p of list) {
+            const conn = ctx.transport.isConnected(p.peerId) ? 'conectado' : 'descubierto';
+            out(`  ${shortId(p.peerId)}  ${p.host}:${p.port}  ${conn}`);
           }
           break;
         }
@@ -200,10 +236,40 @@ function setupCli(ctx: CliCtx): void {
           if (!ctx.transport.isConnected(target)) { out('peer no conectado todavía'); break; }
           const files = await ctx.requestList(target);
           if (files.length === 0) { out('(catálogo vacío)'); break; }
-          out('  fileId    name                                size       piezas');
+          out('  fileId    name                                      size       piezas');
           for (const f of files) {
-            out(`  ${shortId(f.fileId)}  ${f.name.padEnd(36).slice(0, 36)}  ${String(f.size).padStart(10)}  ${f.numPieces}`);
+            out(`  ${shortId(f.fileId)}  ${f.name.padEnd(40).slice(0, 40)}  ${String(f.size).padStart(10)}  ${f.numPieces}`);
           }
+          break;
+        }
+        case 'get': {
+          const prefix = rest[0];
+          const name = rest.slice(1).join(' ');
+          if (!prefix || !name) { out('uso: get <peerId> <nombreArchivo>'); break; }
+          const target = resolvePeer(prefix);
+          if (!target) { out('peer no resuelto'); break; }
+          if (!ctx.transport.isConnected(target)) { out('peer no conectado'); break; }
+          // Asegurar catálogo del peer; preferimos uno fresco.
+          let files = ctx.remoteCatalog.get(target);
+          if (!files) files = await ctx.requestList(target);
+          const summary = files.find((f) => f.name === name);
+          if (!summary) { out(`archivo "${name}" no está en el catálogo de ${shortId(target)}`); break; }
+          const manifest = await ctx.requestManifest(target, summary.fileId);
+          out(`comenzando descarga ${manifest.name} (${manifest.size} bytes, ${manifest.numPieces} piezas)`);
+          ctx.scheduler
+            .startDownload(manifest)
+            .then((p) => out(`✔ descargado: ${p}`))
+            .catch((err) => out(`✘ falló descarga: ${err.message}`));
+          break;
+        }
+        case 'status': {
+          const ds = ctx.scheduler.status();
+          if (ds.length === 0) { out('(sin descargas activas)'); }
+          for (const d of ds) {
+            const pct = ((d.have / d.total) * 100).toFixed(1);
+            out(`  ${d.name}  ${d.have}/${d.total} piezas  ${pct}%  ${d.rateKBs} KB/s`);
+          }
+          out(`  peers conectados: ${ctx.transport.connectedPeers().length}`);
           break;
         }
         case 'msg': {
@@ -214,10 +280,6 @@ function setupCli(ctx: CliCtx): void {
           out('(msg) ejercicio para alumnos — ver docs/EXERCISES.md');
           break;
         }
-        case 'get':
-        case 'status':
-          out(`(${cmd}) disponible en etapas siguientes`);
-          break;
         case 'quit':
         case 'exit':
           rl.close();
