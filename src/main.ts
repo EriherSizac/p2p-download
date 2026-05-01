@@ -81,6 +81,10 @@ async function bootstrap(): Promise<void> {
     log.warn('fs.watch no disponible:', (err as Error).message);
   }
 
+  // Sinks que setupCli rellena al construir readline; usados desde handleMessage
+  // para imprimir eventos asíncronos (chat) sin romper el prompt.
+  const cliSinks: { chat?: (from: string, text: string) => void } = {};
+
   const remoteCatalog = new Map<string, FileSummary[]>();
   const remoteManifests = new Map<string, FileManifest>(); // `${peerId}:${fileId}`
 
@@ -152,8 +156,8 @@ async function bootstrap(): Promise<void> {
         log.warn(`error de ${shortId(from)}: ${msg.code} ${msg.message}`);
         break;
       case MSG.CHAT:
-        // TODO(ALUMNO): imprimir el chat sin romper el prompt de readline.
-        log.info(`[chat][${shortId(from)}] ${msg.text}`);
+        // El renderizado lo provee setupCli para no romper el prompt.
+        cliSinks.chat?.(from, msg.text);
         break;
       default:
         // HAVE/REQUEST/PIECE los maneja el scheduler.
@@ -202,6 +206,7 @@ async function bootstrap(): Promise<void> {
     remoteCatalog,
     requestList,
     requestManifest,
+    sinks: cliSinks,
   });
 
   const shutdown = (): void => {
@@ -224,16 +229,39 @@ interface CliCtx {
   remoteCatalog: Map<string, FileSummary[]>;
   requestList: (peerId: string) => Promise<FileSummary[]>;
   requestManifest: (peerId: string, fileId: string) => Promise<FileManifest>;
+  sinks: { chat?: (from: string, text: string) => void };
 }
 
 function setupCli(ctx: CliCtx): void {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   rl.setPrompt('p2p> ');
-  rl.prompt();
 
   const out = (s: string): void => {
     process.stdout.write(s.endsWith('\n') ? s : s + '\n');
   };
+
+  const printMenu = (): void => {
+    out('');
+    out('  ┌─ menú ───────────────────────────────────────────┐');
+    out('  │  chat <texto>          difunde mensaje a todos   │');
+    out('  │  share                 lista archivos compartidos│');
+    out('  │  search [nombre]       busca en peers conectados │');
+    out('  │  get <peerId> <name>   descarga un archivo       │');
+    out('  │  peers | status        info del enjambre         │');
+    out('  │  menu | help | quit                              │');
+    out('  └──────────────────────────────────────────────────┘');
+  };
+
+  // Render de chat entrante: limpia la línea actual, imprime el chat y
+  // restaura el prompt + lo que el usuario tenía a medio teclear.
+  ctx.sinks.chat = (from: string, text: string): void => {
+    process.stdout.write('\r\x1b[K');
+    process.stdout.write(`\x1b[35m[chat][${shortId(from)}]\x1b[0m ${text}\n`);
+    rl.prompt(true);
+  };
+
+  printMenu();
+  rl.prompt();
 
   const resolvePeer = (prefix: string): string | undefined => {
     const all = ctx.discovery.list().map((p) => p.peerId);
@@ -301,20 +329,68 @@ function setupCli(ctx: CliCtx): void {
           break;
         }
         case 'msg': {
-          // TODO(ALUMNO): implementar mensajería directa.
+          // TODO(ALUMNO): implementar mensajería **directa** (1-a-1).
           // - Validar rest[0] como prefijo de peerId conectado.
           // - Construir Message CHAT con {text: rest.slice(1).join(' '), ts: Date.now()}.
           // - transport.send(peerId, msg). Si false, avisar al usuario.
+          // (El comando `chat` ya hace broadcast; este queda como ejercicio 1.)
           out('(msg) ejercicio para alumnos — ver docs/EXERCISES.md');
           break;
         }
+        case 'chat': {
+          const text = rest.join(' ');
+          if (!text) { out('uso: chat <texto>'); break; }
+          const connected = ctx.transport.connectedPeers();
+          if (connected.length === 0) { out('no hay peers conectados'); break; }
+          ctx.transport.broadcast({ type: MSG.CHAT, text, ts: Date.now() });
+          out(`(chat) → ${connected.length} peer(s)`);
+          break;
+        }
+        case 'share': {
+          const list = ctx.index.list();
+          if (list.length === 0) {
+            out('(sin archivos en SHARED_DIR — añade archivos y se reindexan en caliente)');
+            break;
+          }
+          out('  fileId    name                                      size       piezas');
+          for (const f of list) {
+            out(`  ${shortId(f.fileId)}  ${f.name.padEnd(40).slice(0, 40)}  ${String(f.size).padStart(10)}  ${f.numPieces}`);
+          }
+          break;
+        }
+        case 'search': {
+          const query = rest.join(' ').toLowerCase();
+          const connected = ctx.transport.connectedPeers();
+          if (connected.length === 0) { out('no hay peers conectados — espera al descubrimiento'); break; }
+          out(`buscando${query ? ` "${query}"` : ''} en ${connected.length} peer(s)…`);
+          const results = await Promise.allSettled(
+            connected.map(async (pid) => ({ pid, files: await ctx.requestList(pid) })),
+          );
+          let total = 0;
+          out('  peerId    fileId    name                                size');
+          for (const r of results) {
+            if (r.status !== 'fulfilled') continue;
+            const matches = query
+              ? r.value.files.filter((f) => f.name.toLowerCase().includes(query))
+              : r.value.files;
+            for (const f of matches) {
+              out(`  ${shortId(r.value.pid)}  ${shortId(f.fileId)}  ${f.name.padEnd(36).slice(0, 36)}  ${String(f.size).padStart(10)}`);
+              total += 1;
+            }
+          }
+          out(`(${total} resultado(s)) — usa: get <peerId> <name>`);
+          break;
+        }
+        case 'menu':
+          printMenu();
+          break;
         case 'quit':
         case 'exit':
           rl.close();
           process.kill(process.pid, 'SIGINT');
           return;
         case 'help':
-          out('comandos: peers | list <peerId> | get <peerId> <name> | status | msg <peerId> <texto> | quit');
+          out('comandos: peers | list <peerId> | get <peerId> <name> | status | chat <texto> | share | search [nombre] | msg <peerId> <texto> | menu | quit');
           break;
         default:
           out(`comando desconocido: ${cmd}`);
