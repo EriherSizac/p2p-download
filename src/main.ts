@@ -242,14 +242,17 @@ function setupCli(ctx: CliCtx): void {
 
   const printMenu = (): void => {
     out('');
-    out('  ┌─ menú ───────────────────────────────────────────┐');
-    out('  │  chat <texto>          difunde mensaje a todos   │');
-    out('  │  share                 lista archivos compartidos│');
-    out('  │  search [nombre]       busca en peers conectados │');
-    out('  │  get <peerId> <name>   descarga un archivo       │');
-    out('  │  peers | status        info del enjambre         │');
-    out('  │  menu | help | quit                              │');
-    out('  └──────────────────────────────────────────────────┘');
+    out('  ┌─ menú ───────────────────────────────────────────────┐');
+    out('  │  chat <texto>          difunde mensaje a todos       │');
+    out('  │  share                 lista mis archivos publicados │');
+    out('  │  share <ruta>          publica un archivo (cualquier │');
+    out('  │                        ruta absoluta o relativa)     │');
+    out('  │  unshare <nombre>      retira del catálogo           │');
+    out('  │  search [nombre]       busca en peers conectados     │');
+    out('  │  get <peerId> <name>   descarga un archivo           │');
+    out('  │  peers | status        info del enjambre             │');
+    out('  │  menu | help | quit                                  │');
+    out('  └──────────────────────────────────────────────────────┘');
   };
 
   // Render de chat entrante: limpia la línea actual, imprime el chat y
@@ -347,15 +350,47 @@ function setupCli(ctx: CliCtx): void {
           break;
         }
         case 'share': {
-          const list = ctx.index.list();
-          if (list.length === 0) {
-            out('(sin archivos en SHARED_DIR — añade archivos y se reindexan en caliente)');
+          // Sin argumentos: imprimir catálogo local. Con ruta: añadir.
+          if (rest.length === 0) {
+            const list = ctx.index.list();
+            if (list.length === 0) {
+              out('Catálogo local vacío. No hay archivos publicados.');
+              out('Para publicar un archivo:');
+              out(`  · uso interactivo:  share <ruta>`);
+              out(`  · o copia archivos en  ${SHARED_DIR}  (se reindexan en caliente).`);
+              break;
+            }
+            out('Archivos publicados en este peer:');
+            out('  fileId    name                                      size       piezas');
+            for (const f of list) {
+              out(`  ${shortId(f.fileId)}  ${f.name.padEnd(40).slice(0, 40)}  ${String(f.size).padStart(10)}  ${f.numPieces}`);
+            }
             break;
           }
-          out('  fileId    name                                      size       piezas');
-          for (const f of list) {
-            out(`  ${shortId(f.fileId)}  ${f.name.padEnd(40).slice(0, 40)}  ${String(f.size).padStart(10)}  ${f.numPieces}`);
+
+          // share <ruta>: la ruta puede contener espacios → reunirla.
+          const raw = rest.join(' ').replace(/^['"]|['"]$/g, '');
+          const manifest = await ctx.index.addPath(raw);
+
+          // Anunciar HAVE con bitfield lleno a todos los peers conectados.
+          const numBytes = Math.ceil(manifest.numPieces / 8);
+          const full = Buffer.alloc(numBytes);
+          for (let i = 0; i < manifest.numPieces; i++) {
+            full[i >> 3] = (full[i >> 3] ?? 0) | (1 << (7 - (i & 7)));
           }
+          ctx.transport.broadcast({
+            type: MSG.HAVE,
+            fileId: manifest.fileId,
+            bitfield: full.toString('base64'),
+          });
+          out(`Publicado: ${manifest.name}  (${manifest.size} bytes, ${manifest.numPieces} piezas, fileId=${shortId(manifest.fileId)})`);
+          break;
+        }
+        case 'unshare': {
+          const name = rest.join(' ');
+          if (!name) { out('uso: unshare <nombreArchivo>'); break; }
+          const ok = ctx.index.removeExternal(name);
+          out(ok ? `Quitado del catálogo: ${name}` : `No se pudo quitar "${name}" (¿está en SHARED_DIR? hay que borrarlo del disco).`);
           break;
         }
         case 'search': {
@@ -390,7 +425,7 @@ function setupCli(ctx: CliCtx): void {
           process.kill(process.pid, 'SIGINT');
           return;
         case 'help':
-          out('comandos: peers | list <peerId> | get <peerId> <name> | status | chat <texto> | share | search [nombre] | msg <peerId> <texto> | menu | quit');
+          out('comandos: peers | list <peerId> | get <peerId> <name> | status | chat <texto> | share [ruta] | unshare <name> | search [nombre] | msg <peerId> <texto> | menu | quit');
           break;
         default:
           out(`comando desconocido: ${cmd}`);
