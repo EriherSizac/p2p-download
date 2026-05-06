@@ -30,8 +30,7 @@ export const MSG = {
   REQUEST: 0x07,
   PIECE: 0x08,
   ERROR: 0x09,
-  CHAT: 0x0a,
-  BYE: 0x0b,
+  BYE: 0x0a,
 } as const;
 
 export type MsgType = (typeof MSG)[keyof typeof MSG];
@@ -65,7 +64,6 @@ export type Message =
   | { type: typeof MSG.REQUEST; fileId: string; pieceIndex: number }
   | { type: typeof MSG.PIECE; fileId: string; pieceIndex: number; data: Buffer }
   | { type: typeof MSG.ERROR; code: string; message: string }
-  | { type: typeof MSG.CHAT; text: string; ts: number }
   | { type: typeof MSG.BYE };
 
 export const PROTOCOL_VERSION = 1;
@@ -125,17 +123,7 @@ export function decode(buf: Buffer): Message {
     case MSG.MANIFEST_REPLY:
     case MSG.HAVE:
     case MSG.REQUEST:
-    case MSG.ERROR:
-    case MSG.CHAT: {
-      // TODO(ALUMNO): el caso CHAT actualmente cae en este decode JSON
-      // genérico, lo cual ya funciona si tu encode pone {text, ts} en el JSON.
-      // Sin embargo, debes implementar:
-      //   1) la rama de encode (en este mismo archivo) — verifica que CHAT
-      //      serializa correctamente solo los campos {text, ts}.
-      //   2) el comando CLI `msg <peerId> <texto>` en src/main.ts.
-      //   3) el handler de mensajes entrantes que imprima en consola.
-      // Pista: el switch genérico de encode ya cubre CHAT, pero asegúrate de
-      // que `text` no contiene caracteres que rompan tu UI (newlines, ANSI).
+    case MSG.ERROR: {
       const obj = JSON.parse(body.toString('utf8')) as Record<string, unknown>;
       return { type, ...obj } as Message;
     }

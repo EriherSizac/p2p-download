@@ -135,7 +135,12 @@ dist
 .yarn/install-state.gz
 .pnp.*
 
-# p2p-download runtime
+# p2p-download runtime (legacy root + por-proyecto)
 shared/
 downloads/
 .demo/
+p2p-files/shared/
+p2p-files/downloads/
+p2p-files/.demo/
+p2p-files/dist/
+p2p-chat/dist/

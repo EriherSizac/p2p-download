@@ -1,0 +1,20 @@
+{
+  "name": "p2p-chat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chat P2P didáctico en LAN. Solo módulos nativos de Node. Hermano de p2p-files; lógica intencionalmente duplicada para evitar acoplar ambos proyectos.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "build": "tsc -p .",
+    "start": "node dist/main.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}

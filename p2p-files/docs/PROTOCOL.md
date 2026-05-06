@@ -33,8 +33,7 @@ El primer byte del payload identifica el tipo:
 | 0x07  | REQUEST          | JSON `{fileId: string, pieceIndex: number}`                              |
 | 0x08  | PIECE            | uint32BE headerLen + JSON `{fileId, pieceIndex}` + bytes de la pieza     |
 | 0x09  | ERROR            | JSON `{code: string, message: string}`                                   |
-| 0x0A  | CHAT             | JSON `{text: string, ts: number}`  *(ejercicio)*                         |
-| 0x0B  | BYE              | (vacío)                                                                  |
+| 0x0A  | BYE              | (vacío)                                                                  |
 
 ### `FileSummary`
 
