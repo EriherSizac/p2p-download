@@ -74,14 +74,34 @@ const log = createLogger('call');
 // Configuración fija.
 // ---------------------------------------------------------------------------
 
-/** Servidores STUN públicos. Solo se usan para descubrir nuestra IP pública
- *  (candidatos srflx). NO retransmiten media; eso sería TURN, que aquí no
- *  habilitamos para mantener la demo simple. Si ambos peers están detrás de
- *  NATs simétricos sin TURN, la llamada fallará — es una limitación
- *  conocida y didáctica (ver docs/NAT.md). */
+/**
+ * Servidores STUN públicos (RFC 5389). Funcionan como un "espejo": le mandas
+ * un BINDING REQUEST y te contesta con la IP:puerto pública desde la que vio
+ * tu paquete. Esa info se transforma en un candidato ICE de tipo "srflx"
+ * (server-reflexive). Ese es el candidato que un peer detrás de NAT necesita
+ * publicar para que el otro extremo sepa adónde mandar UDP.
+ *
+ * NO confundir con TURN (RFC 5766): TURN sí retransmite media — es un relay
+ * UDP de pago/auto-hospedado. Sin TURN, dos peers con NAT simétrico (cada
+ * salida = puerto distinto y aleatorio) no se pueden ver: ICE fallará. Es
+ * el caso real más común tras "no me funciona la llamada". Ver docs/NAT.md.
+ *
+ * Aquí ponemos un STUN público (Google) por simplicidad. Si tu uso es serio
+ * deberías auto-hospedar tu STUN/TURN (coturn) por privacidad y SLA.
+ */
 const STUN_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
 
-/** Codec único negociado: Opus a 48kHz estéreo, payload type 96. */
+/**
+ * Codec Opus (RFC 6716): el estándar de facto para voz en WebRTC.
+ *   - 48 kHz de sample rate (mismo que CD digital, no necesita resampling
+ *     porque WebRTC siempre usa 48k internamente)
+ *   - 2 canales (estéreo). Para voz pura podrías bajar a 1 (mono) y reducir
+ *     bitrate; lo dejamos en 2 para que también valga música/file:
+ *   - Payload Type 96: en RTP los PT 0–95 están "fijos" por IANA (RFC 3551:
+ *     PT 0 = PCMU, PT 8 = PCMA, etc.). El rango 96–127 es "dynamic":
+ *     cada sesión negocia qué codec va en cada número. WebRTC siempre usa
+ *     PT dinámicos para Opus.
+ */
 const OPUS_PT = 96;
 const opusCodec = new RTCRtpCodecParameters({
   mimeType: 'audio/opus',
@@ -122,6 +142,21 @@ function buildFfmpegSenderArgs(source: string, target: { host: string; port: num
     }
   }
 
+  // Args de salida de ffmpeg. Cada flag tiene su porqué:
+  //   -ac 2          → 2 canales (estéreo). Debe coincidir con opusCodec.
+  //   -ar 48000      → resample a 48 kHz. Si la fuente ya está a 48k, no-op.
+  //   -c:a libopus   → encoder Opus.
+  //   -b:a 64k       → bitrate constante 64 kbps. Voz buena ≥24k, música ≥96k.
+  //   -application voip → ajusta el encoder para latencia (vs music/lowdelay).
+  //                       voip activa DTX, redundancia y un perfil agresivo
+  //                       en cuanto a bandas de frecuencia.
+  //   -payload_type 96 → PT dinámico; tiene que coincidir con OPUS_PT en
+  //                      el SDP que ofrecemos (si no, el receptor descartará
+  //                      los paquetes porque no sabe qué codec son).
+  //   -f rtp rtp://…  → muxer RTP. ffmpeg fragmenta el flujo Opus en
+  //                      paquetes RTP (~20 ms cada uno) con su header de 12
+  //                      bytes, los serializa y los manda por UDP.
+  //   -loglevel warning → menos ruido en stderr; los errores aún salen.
   return [
     ...inputArgs,
     '-ac', '2',
@@ -159,8 +194,22 @@ function micInputArgs(spec?: string): string[] {
 }
 
 /**
- * Construye el SDP que ffplay leerá para reproducir el RTP entrante.
- * Es un fichero de texto que describe "voy a recibir Opus por este puerto".
+ * Construye un SDP "minimal" (RFC 4566) que describe el flujo entrante para
+ * ffplay. SDP = Session Description Protocol; es texto plano con líneas
+ * `clave=valor`. Para ffplay solo necesitamos:
+ *
+ *   v=0                              versión del protocolo SDP (siempre 0)
+ *   o=- 0 0 IN IP4 127.0.0.1         origin (username/sessId/version, IPv4)
+ *   s=p2p-chat                       nombre de sesión (cosmético)
+ *   c=IN IP4 127.0.0.1               connection data: por dónde llega
+ *   t=0 0                            tiempo (0 0 = sesión permanente)
+ *   m=audio <port> RTP/AVP <PT>      media line: audio en `port`, perfil RTP
+ *                                    Audio/Video clásico, payload type 96
+ *   a=rtpmap:96 opus/48000/2         mapeo PT→codec: PT 96 es Opus 48k 2ch
+ *
+ * ffplay lee este fichero, decide "abriré un socket UDP en 127.0.0.1:<port>
+ * y voy a esperar paquetes RTP cuyo PT 96 son Opus estéreo". Nosotros le
+ * mandaremos exactamente eso desde el bridge.
  */
 function buildReceiverSdp(localPort: number): string {
   return [
@@ -328,8 +377,27 @@ export class Call extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private setupPeerConnection(): void {
-    // El PC es el "motor" WebRTC: maneja ICE, DTLS, SRTP. Lo configuramos
-    // con un único codec (Opus) y un STUN público — todo lo demás es default.
+    // El PC orquesta tres protocolos que viven sobre UDP:
+    //
+    //   ICE (RFC 8445): conectividad. Cada peer publica "candidatos" (IP:puerto
+    //   por los que se le puede contactar). Tres tipos comunes:
+    //     - host:  la IP local de la interfaz (172.20.x.x, 192.168.x.x...).
+    //              Solo funciona si ambos peers están en la misma LAN.
+    //     - srflx (server-reflexive): la IP:puerto pública vista por el STUN.
+    //              Sirve si el NAT del peer reusa el mismo puerto para todas
+    //              las conexiones salientes (cone NAT).
+    //     - relay: dirección de un TURN que retransmite. Último recurso para
+    //              NATs simétricos. NO usamos aquí (no hay TURN configurado).
+    //   Los candidatos van por la señalización (CALL_ICE) y se prueban en pares.
+    //
+    //   DTLS (RFC 6347): handshake sobre UDP para acordar claves SRTP. Cada
+    //   peer presenta un certificado autofirmado al vuelo; los huellas
+    //   (fingerprints) se publican en la SDP, así MITM es detectable si
+    //   confías en la señalización.
+    //
+    //   SRTP (RFC 3711): RTP cifrado con AES-CM 128 + HMAC-SHA1, claves
+    //   derivadas del DTLS. Cada paquete RTP sale como un blob opaco que
+    //   solo el peer remoto puede descifrar.
     this.pc = new RTCPeerConnection({
       iceServers: STUN_SERVERS,
       codecs: { audio: [opusCodec] },
@@ -404,9 +472,28 @@ export class Call extends EventEmitter {
       });
     });
 
-    // (c) Cada datagrama que llegue del ffmpeg es UN paquete RTP listo.
-    //     writeRtp() lo entrega a werift, que lo cifrará con SRTP y lo
-    //     enviará por el camino ICE elegido hasta el peer remoto.
+    // (c) Cada datagrama UDP que llega es UN paquete RTP completo (RFC 3550):
+    //
+    //   0                   1                   2                   3
+    //   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //  |V=2|P|X|  CC   |M|     PT      |       sequence number         |
+    //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //  |                           timestamp                           |
+    //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //  |           synchronization source (SSRC) identifier            |
+    //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //  |                       payload (Opus)                          |
+    //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    //
+    //  - V=2 fijo, M (marker) suele ser 0 para audio, PT=96 (Opus).
+    //  - sequence number incrementa 1 por paquete; permite detectar pérdidas.
+    //  - timestamp avanza en muestras (48000 Hz → +960 por trama de 20 ms).
+    //  - SSRC identifica el flujo; werift le pone uno aleatorio al crear el
+    //    track. Útil cuando hay multiplexing de varios flujos.
+    //
+    // ffmpeg ya nos da TODO esto correctamente formateado. Solo lo pasamos
+    // tal cual a writeRtp(); werift lo encripta con SRTP y lo envía.
     this.senderBridge.on('message', (chunk) => {
       try {
         this.localTrack?.writeRtp(chunk);
@@ -472,6 +559,17 @@ export class Call extends EventEmitter {
     this.playerSdpPath = path.join(tmpdir(), `p2p-chat-${this.callId}-${randomBytes(3).toString('hex')}.sdp`);
     writeFileSync(this.playerSdpPath, buildReceiverSdp(this.playerBridgePort), 'utf8');
 
+    // Flags de ffplay, cada uno con su razón:
+    //   -protocol_whitelist file,rtp,udp → por seguridad ffmpeg restringe
+    //      qué protocolos puede tocar un input. Como nuestro -i es un
+    //      fichero .sdp que internamente hace `rtp://udp://...`, hay que
+    //      autorizar los tres. Por defecto no permite rtp.
+    //   -fflags nobuffer → desactiva el buffer de demuxing para reducir
+    //      latencia.
+    //   -flags low_delay → idem a nivel decoder.
+    //   -nodisp → no abrir ventana SDL. Audio-only.
+    //   -autoexit → cuando el flujo se corta, salir. Si no, se queda colgado.
+    //   -loglevel warning → silenciar status; los errores sí salen.
     const ffplayArgs = [
       '-protocol_whitelist', 'file,rtp,udp',
       '-fflags', 'nobuffer',

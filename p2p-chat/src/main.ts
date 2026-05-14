@@ -164,8 +164,26 @@ async function bootstrap(): Promise<void> {
         if (sentAt === undefined) break; // nonce desconocido (duplicado, etc.)
         liv.pendingPings.delete(msg.nonce);
         const rtt = Date.now() - sentAt;
-        // Media móvil exponencial: el nuevo valor pesa α, el histórico (1-α).
-        // Si es la primera medida no hay histórico → tomar el valor crudo.
+        // EWMA — Exponentially Weighted Moving Average:
+        //
+        //   R[t] = α·x[t] + (1-α)·R[t-1]
+        //
+        // donde x[t] es la medida cruda y R[t] el RTT suavizado. Si lo
+        // desarrollas hacia atrás:
+        //
+        //   R[t] = α·x[t] + α(1-α)·x[t-1] + α(1-α)²·x[t-2] + ...
+        //
+        // → cada medida pasada pesa con un factor que decae
+        // geométricamente. Con α=0.2, la medida actual contribuye 20%,
+        // la anterior 16%, la de antes 12.8%, etc. Es como una media
+        // móvil con "memoria" suave, sin necesidad de guardar un buffer.
+        //
+        // Trade-off de α:
+        //   α grande (→1)  → reactivo, ruidoso, sigue picos.
+        //   α pequeño (→0) → estable, lento de responder a cambios reales.
+        //   0.2 es un punto medio típico para RTT (TCP usa 0.125).
+        //
+        // Caso base (primera medida): no hay histórico → R = x crudo.
         liv.rttMs = liv.rttMs === undefined
           ? rtt
           : RTT_EWMA_ALPHA * rtt + (1 - RTT_EWMA_ALPHA) * liv.rttMs;
