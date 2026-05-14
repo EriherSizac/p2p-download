@@ -241,40 +241,60 @@ export class Call extends EventEmitter {
   // API pública.
   // -------------------------------------------------------------------------
 
-  /** Lanza la llamada (solo caller). Crea PC, addTrack, envía CALL_OFFER. */
+  /**
+   * Lanza la llamada (solo caller). Pasos clásicos del "offer/answer":
+   *   1) crear el RTCPeerConnection (escucha eventos ICE/track)
+   *   2) preparar la fuente de audio local (track + ffmpeg)
+   *   3) generar la SDP OFFER (qué codecs ofrezco, cómo recibo RTP)
+   *   4) fijarla como `localDescription` — esto arranca la recolección
+   *      de candidatos ICE; cada uno saldrá por `onIceCandidate`
+   *   5) mandar la SDP al callee por el canal de señalización (TCP)
+   */
   async start(): Promise<void> {
     if (this.role !== 'caller') throw new Error('start() solo en caller');
-    this.setupPeerConnection();
-    await this.setupSender();
+    this.setupPeerConnection();      // (1)
+    await this.setupSender();        // (2)
     this.setState('signaling');
 
-    const offer = await this.pc.createOffer();
-    await this.pc.setLocalDescription(offer);
-    this.opts.signal({ type: 'offer', sdp: offer.sdp });
+    const offer = await this.pc.createOffer();          // (3)
+    await this.pc.setLocalDescription(offer);           // (4) — empieza ICE gathering
+    this.opts.signal({ type: 'offer', sdp: offer.sdp }); // (5)
   }
 
-  /** Aceptar una oferta entrante (callee). Crea PC, addTrack, responde. */
+  /**
+   * Aceptar una oferta entrante (callee). Simétrico a start(), pero con
+   * la SDP del peer remoto ya disponible:
+   *   1) PC + ffmpeg local (como caller)
+   *   2) setRemoteDescription(offer) → el PC sabe qué nos ofrece el otro
+   *   3) createAnswer() → genera la respuesta compatible
+   *   4) setLocalDescription(answer) → arranca ICE en este extremo
+   *   5) mandar la answer de vuelta
+   */
   async accept(remoteSdp: string): Promise<void> {
     if (this.role !== 'callee') throw new Error('accept() solo en callee');
     this.setupPeerConnection();
     await this.setupSender();
     this.setState('signaling');
 
-    await this.pc.setRemoteDescription({ type: 'offer', sdp: remoteSdp });
-    const answer = await this.pc.createAnswer();
-    await this.pc.setLocalDescription(answer);
-    this.opts.signal({ type: 'answer', sdp: answer.sdp });
+    await this.pc.setRemoteDescription({ type: 'offer', sdp: remoteSdp }); // (2)
+    const answer = await this.pc.createAnswer();                            // (3)
+    await this.pc.setLocalDescription(answer);                              // (4)
+    this.opts.signal({ type: 'answer', sdp: answer.sdp });                  // (5)
   }
 
-  /** Procesa una respuesta SDP del callee (solo caller). */
+  /** Procesa la respuesta SDP del callee. Tras esto, ambos extremos saben
+   *  qué van a usar (codec, SSRC, etc.) y solo falta que ICE encuentre el
+   *  par de candidatos válido para empezar a mover SRTP. */
   async onAnswer(sdp: string): Promise<void> {
     if (this.role !== 'caller') return;
     await this.pc.setRemoteDescription({ type: 'answer', sdp });
   }
 
-  /** Aplica un candidato ICE recibido del peer remoto. */
+  /** Aplica un candidato ICE remoto. Cada candidato es una pista de "yo
+   *  podría recibir por aquí" (IP:puerto). werift los irá probando contra
+   *  los nuestros locales hasta encontrar un par que pase el NAT. */
   async onIce(candidate: IceCandidatePayload | null): Promise<void> {
-    if (!candidate) return; // fin de candidatos: no se aplica
+    if (!candidate) return; // null = "fin de candidatos" (no requiere acción)
     try {
       await this.pc.addIceCandidate(candidate as RTCIceCandidate);
     } catch (err) {
@@ -308,13 +328,18 @@ export class Call extends EventEmitter {
   // -------------------------------------------------------------------------
 
   private setupPeerConnection(): void {
+    // El PC es el "motor" WebRTC: maneja ICE, DTLS, SRTP. Lo configuramos
+    // con un único codec (Opus) y un STUN público — todo lo demás es default.
     this.pc = new RTCPeerConnection({
       iceServers: STUN_SERVERS,
       codecs: { audio: [opusCodec] },
     });
 
-    // Trickle ICE: cada candidato local lo enviamos al remoto en cuanto se
-    // descubre. El `undefined` final indica "no hay más candidatos".
+    // ── Evento 1: cada candidato ICE local que descubrimos ──────────────
+    // Trickle ICE = no esperamos a tener todos los candidatos; mandamos
+    // cada uno por la señalización en cuanto sale. Eso acelera el setup.
+    // `c === undefined` significa "ya no hay más candidatos" → mandamos
+    // null para que el peer remoto lo sepa.
     this.pc.onIceCandidate.subscribe((c) => {
       this.opts.signal({
         type: 'ice',
@@ -322,6 +347,9 @@ export class Call extends EventEmitter {
       });
     });
 
+    // ── Evento 2: cambios de estado de la conexión global ───────────────
+    // "connected" = ICE pasó, DTLS pasó, los paquetes SRTP ya pueden fluir.
+    // "failed/disconnected/closed" = la llamada se ha caído → limpiar.
     this.pc.connectionStateChange.subscribe((s) => {
       log.debug(`[${this.callId}] connectionState=${s}`);
       if (s === 'connected') this.setState('active');
@@ -330,6 +358,8 @@ export class Call extends EventEmitter {
       }
     });
 
+    // ── Evento 3: estado específico de ICE ──────────────────────────────
+    // Útil para mostrar "conectando..." en el CLI mientras ICE elige par.
     this.pc.iceConnectionStateChange.subscribe((s) => {
       log.debug(`[${this.callId}] iceConnectionState=${s}`);
       if (this.state === 'signaling' && (s === 'checking' || s === 'connected')) {
@@ -337,8 +367,9 @@ export class Call extends EventEmitter {
       }
     });
 
-    // Track entrante: el peer remoto nos está enviando audio. Lo redirigimos
-    // a ffplay (si playback) para reproducirlo por los altavoces.
+    // ── Evento 4: track entrante (el remoto nos manda audio) ────────────
+    // Cada `addTransceiver(...sendrecv)` del otro extremo dispara aquí UN
+    // track. Lo encadenamos a ffplay para que lo reproduzcamos.
     this.pc.onTrack.subscribe((track) => {
       log.info(`[${this.callId}] track entrante: kind=${track.kind}`);
       void this.setupPlayer(track);
@@ -350,13 +381,22 @@ export class Call extends EventEmitter {
    * → reenviar cada datagrama a werift como un paquete RTP.
    */
   private async setupSender(): Promise<void> {
+    // (a) Track de salida: representa "mi micrófono" en lenguaje WebRTC.
+    //     Aún no tiene datos — los inyectaremos con writeRtp().
     this.localTrack = new MediaStreamTrack({ kind: 'audio' });
+    // sendrecv = "voy a mandar Y a recibir". Si solo quisieras hablar,
+    // usarías "sendonly"; si solo escuchar, "recvonly".
     this.pc.addTransceiver(this.localTrack, { direction: 'sendrecv' });
 
-    // Bridge UDP local: nos atamos a un puerto efímero y ahí escribirá ffmpeg.
+    // (b) Bridge UDP local entre ffmpeg y werift. ffmpeg no sabe enchufarse
+    //     a un objeto JS; sólo sabe escribir RTP a un host:puerto. Abrimos
+    //     un socket UDP en 127.0.0.1:puerto-libre y le decimos a ffmpeg
+    //     "escribe ahí". Nuestra lógica lee cada datagrama y lo reinyecta
+    //     en werift como paquete RTP.
     this.senderBridge = dgram.createSocket('udp4');
     await new Promise<void>((resolve, reject) => {
       this.senderBridge!.once('error', reject);
+      // bind(0) = el SO nos asigna un puerto libre.
       this.senderBridge!.bind(0, '127.0.0.1', () => {
         const addr = this.senderBridge!.address();
         this.senderBridgePort = addr.port;
@@ -364,8 +404,10 @@ export class Call extends EventEmitter {
       });
     });
 
+    // (c) Cada datagrama que llegue del ffmpeg es UN paquete RTP listo.
+    //     writeRtp() lo entrega a werift, que lo cifrará con SRTP y lo
+    //     enviará por el camino ICE elegido hasta el peer remoto.
     this.senderBridge.on('message', (chunk) => {
-      // Cada datagrama es ya un paquete RTP — se lo pasamos crudo a werift.
       try {
         this.localTrack?.writeRtp(chunk);
       } catch (err) {
@@ -373,7 +415,8 @@ export class Call extends EventEmitter {
       }
     });
 
-    // Lanza ffmpeg apuntando al bridge.
+    // (d) Lanzamos ffmpeg apuntando al bridge. A partir de aquí, audio
+    //     fluye: source → ffmpeg encode Opus → UDP local → werift → SRTP.
     const source = this.opts.source ?? 'tone';
     const args = buildFfmpegSenderArgs(source, { host: '127.0.0.1', port: this.senderBridgePort });
     log.info(`[${this.callId}] ffmpeg sender: ${args.join(' ')}`);
@@ -396,8 +439,10 @@ export class Call extends EventEmitter {
    * con un SDP que describe el flujo.
    */
   private async setupPlayer(track: MediaStreamTrack): Promise<void> {
+    // Modo "sin altavoces": no lanzamos ffplay. Solo contamos paquetes y
+    // bytes recibidos para que el test/CI pueda validar que la conexión
+    // funciona. Útil si la máquina no tiene salida de audio.
     if (this.opts.playback === false) {
-      // Modo sin reproducción: solo contamos paquetes para diagnóstico.
       track.onReceiveRtp.subscribe((pkt) => {
         const buf = pkt.serialize();
         this.rxBytes += buf.length;
@@ -407,10 +452,12 @@ export class Call extends EventEmitter {
       return;
     }
 
+    // (a) Bridge UDP simétrico al del sender, pero al revés:
+    //     werift nos da RtpPacket → lo reescribimos a UDP local →
+    //     ffplay lo consume desde ese puerto.
     this.playerBridge = dgram.createSocket('udp4');
     await new Promise<void>((resolve, reject) => {
       this.playerBridge!.once('error', reject);
-      // Bind a 0 = puerto efímero; ffplay leerá del mismo puerto que ponemos en el SDP.
       this.playerBridge!.bind(0, '127.0.0.1', () => {
         const addr = this.playerBridge!.address();
         this.playerBridgePort = addr.port;
@@ -418,7 +465,10 @@ export class Call extends EventEmitter {
       });
     });
 
-    // Escribir SDP a /tmp y lanzar ffplay.
+    // (b) ffplay no se puede configurar por args para decir "escucha Opus
+    //     en este puerto". Necesita un fichero SDP que describa el flujo
+    //     entrante (codec, port, etc.). Lo generamos al vuelo y lo
+    //     pasamos con -i.
     this.playerSdpPath = path.join(tmpdir(), `p2p-chat-${this.callId}-${randomBytes(3).toString('hex')}.sdp`);
     writeFileSync(this.playerSdpPath, buildReceiverSdp(this.playerBridgePort), 'utf8');
 
@@ -441,6 +491,9 @@ export class Call extends EventEmitter {
       log.warn(`ffplay no se pudo lanzar: ${err.message}. Reproducción desactivada.`);
     });
 
+    // (c) Cada paquete RTP que entra (ya descifrado por werift) lo
+    //     serializamos a Buffer y se lo mandamos por UDP al ffplay.
+    //     Es exactamente la operación inversa al sender.
     track.onReceiveRtp.subscribe((pkt) => {
       const buf = pkt.serialize();
       this.rxBytes += buf.length;

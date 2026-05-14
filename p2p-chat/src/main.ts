@@ -119,10 +119,12 @@ async function bootstrap(): Promise<void> {
         break;
 
       case MSG.CHAT: {
+        // 1) Pintar en pantalla sin romper el prompt del readline.
         cliSinks.chat?.(from, msg.text);
-        // Acuse de recibo (Ej2): inmediato tras renderizar.
+        // 2) Acuse de recibo INMEDIATO. Tras esto el emisor verá su ✓.
+        //    Si nuestro proceso muere antes de este send, el emisor verá ✗.
         transport.send(from, { type: MSG.CHAT_ACK, messageId: msg.messageId });
-        // Persistir en historial (Ej3).
+        // 3) Append al historial local (history.jsonl, una línea JSON).
         void histAppend({
           ts: msg.ts,
           dir: 'in',
@@ -134,11 +136,14 @@ async function bootstrap(): Promise<void> {
       }
 
       case MSG.CHAT_ACK: {
+        // Buscamos el messageId en la tabla de envíos pendientes; si no
+        // está, llegó tarde (ya saltó el timeout) o nunca lo enviamos.
         const pending = pendingAcks.get(msg.messageId);
         if (!pending) {
           log.debug(`ack ${msg.messageId} sin pendiente — ignorado`);
           break;
         }
+        // Limpiamos el timer (evita pintar ✗ retrasado) y dibujamos ✓.
         clearTimeout(pending.timer);
         pendingAcks.delete(msg.messageId);
         cliSinks.ack?.(msg.messageId, from);
@@ -146,17 +151,21 @@ async function bootstrap(): Promise<void> {
       }
 
       case MSG.PING:
-        // Respuesta inmediata con el mismo nonce.
+        // Responder con PONG mismo nonce. NO añadimos timestamp aquí: el
+        // RTT se mide en el lado que pingó (él sabe cuándo mandó cada nonce).
         transport.send(from, { type: MSG.PONG, nonce: msg.nonce });
         break;
 
       case MSG.PONG: {
+        // Buscar el ts del envío correspondiente. RTT = ahora - ts.
         const liv = liveness.get(from);
         if (!liv) break;
         const sentAt = liv.pendingPings.get(msg.nonce);
-        if (sentAt === undefined) break;
+        if (sentAt === undefined) break; // nonce desconocido (duplicado, etc.)
         liv.pendingPings.delete(msg.nonce);
         const rtt = Date.now() - sentAt;
+        // Media móvil exponencial: el nuevo valor pesa α, el histórico (1-α).
+        // Si es la primera medida no hay histórico → tomar el valor crudo.
         liv.rttMs = liv.rttMs === undefined
           ? rtt
           : RTT_EWMA_ALPHA * rtt + (1 - RTT_EWMA_ALPHA) * liv.rttMs;
@@ -164,20 +173,22 @@ async function bootstrap(): Promise<void> {
       }
 
       case MSG.CALL_OFFER: {
+        // Política simple: una sola llamada concurrente por peer remoto.
+        // Si ya estamos hablando con ese peer, devolvemos CALL_END(busy).
         if (callsByPeer.has(from)) {
-          // Ya hay una llamada con este peer. Rechazar la nueva.
           transport.send(from, { type: MSG.CALL_END, callId: msg.callId, reason: 'busy' });
           break;
         }
+        // No construimos el Call todavía: el usuario debe decidir si
+        // `answer` o `hangup`. Mientras tanto, guardamos la oferta.
         cliSinks.info?.(`\x1b[33m📞 llamada entrante de ${shortId(from)}\x1b[0m`);
         cliSinks.info?.('   usa `answer` para aceptar o `hangup` para rechazar');
-        // Aún no construimos el Call: esperamos a que el usuario haga `answer`.
-        // Guardamos la oferta pendiente.
         pendingIncomingOffer = { callId: msg.callId, from, sdp: msg.sdp };
         break;
       }
 
       case MSG.CALL_ANSWER: {
+        // El caller espera la answer; se la entregamos al Call activo.
         const call = calls.get(msg.callId);
         if (!call) {
           log.warn(`CALL_ANSWER para callId desconocido: ${msg.callId}`);
@@ -188,6 +199,8 @@ async function bootstrap(): Promise<void> {
       }
 
       case MSG.CALL_ICE: {
+        // Cada CALL_ICE = un candidato remoto. Lo aplicamos al PC; werift
+        // lo probará contra los nuestros locales (trickle ICE).
         const call = calls.get(msg.callId);
         if (!call) break;
         void call.onIce(msg.candidate);
@@ -195,6 +208,8 @@ async function bootstrap(): Promise<void> {
       }
 
       case MSG.CALL_END: {
+        // Cierre limpio. Puede llegar antes de aceptar (cancela la oferta)
+        // o durante la llamada (hangup remoto).
         const call = calls.get(msg.callId);
         if (call) void call.closeFromRemote(msg.reason);
         if (pendingIncomingOffer && pendingIncomingOffer.callId === msg.callId) {
@@ -218,11 +233,19 @@ async function bootstrap(): Promise<void> {
   // pendingPings; no hace daño, el siguiente ciclo machaca su entrada.
   // ---------------------------------------------------------------------
 
+  // Nonce monotónico global. No hace falta que sea único por peer porque
+  // cada peer guarda sus propios envíos pendientes en su `liveness`.
   let nextNonce = 1;
   const pingTimer = setInterval(() => {
+    // Para cada peer conectado: registra ts de envío y manda PING.
+    // Si el peer no contesta antes del siguiente ciclo, no pasa nada —
+    // el nonce sin respuesta se queda en pendingPings y eventualmente
+    // se reemplaza. No marcamos al peer como muerto desde aquí; la fuente
+    // de verdad para "está vivo" sigue siendo discovery (UDP timeout).
     for (const pid of transport.connectedPeers()) {
       let liv = liveness.get(pid);
       if (!liv) {
+        // Primera vez que pingueamos a este peer → crear su entrada.
         liv = { pendingPings: new Map() };
         liveness.set(pid, liv);
       }
@@ -237,11 +260,17 @@ async function bootstrap(): Promise<void> {
   // ---------------------------------------------------------------------
 
   function spawnCall(opts: { remotePeerId: string; callId: string; role: 'caller' | 'callee'; source?: string }): Call {
+    // El Call NO conoce el transport — esto es deliberado. Le pasamos un
+    // callback `signal()` y él decide qué necesita mandar (offer/answer/
+    // ice/end). Aquí lo traducimos a mensajes concretos del protocolo.
+    // Si mañana cambias el medio de señalización (Slack, WebSocket, ...)
+    // solo este `signal` hay que tocar; call.ts no se entera.
     const call = new Call({
       callId: opts.callId,
       remotePeerId: opts.remotePeerId,
       role: opts.role,
       source: opts.source,
+      // Permite desactivar ffplay (CI / sin altavoces) sin tocar código.
       playback: process.env['CALL_PLAYBACK'] !== '0',
       signal: (m) => {
         if (m.type === 'offer') transport.send(opts.remotePeerId, { type: MSG.CALL_OFFER, callId: opts.callId, sdp: m.sdp });
@@ -250,13 +279,16 @@ async function bootstrap(): Promise<void> {
         else if (m.type === 'end') transport.send(opts.remotePeerId, { type: MSG.CALL_END, callId: opts.callId, reason: m.reason });
       },
     });
+    // Doble índice: por callId (mensajes entrantes) y por peerId (UI / dedupe).
     calls.set(opts.callId, call);
     callsByPeer.set(opts.remotePeerId, opts.callId);
 
+    // Eventos del Call → UI. El Call emite; aquí decidimos cómo se pinta.
     call.on('state', (s) => {
       cliSinks.info?.(`📞 llamada ${opts.callId} → ${s}`);
     });
     call.on('ended', (reason) => {
+      // Limpiar índices al cerrar para que un futuro `call <peer>` funcione.
       calls.delete(opts.callId);
       callsByPeer.delete(opts.remotePeerId);
       cliSinks.info?.(`📞 llamada ${opts.callId} terminada (${reason ?? '?'})`);
@@ -367,6 +399,16 @@ function setupCli(ctx: CliCtx): void {
     return `${liv.rttMs.toFixed(1)} ms`;
   };
 
+  /**
+   * Envío de un CHAT directo con tracking de ACK.
+   *
+   * Patrón general:
+   *   1) Generar un messageId único (correlaciona CHAT con su ACK).
+   *   2) `transport.send` devuelve false si no hay socket → fallo inmediato.
+   *   3) Persistir en historial sin esperar al ACK (es nuestra copia).
+   *   4) Armar un timer: si dispara antes del ACK, pinta ✗.
+   *   5) Si llega el ACK (en handleMessage), se limpia el timer y pinta ✓.
+   */
   const sendChat = (toPeerId: string, text: string): void => {
     const messageId = newMessageId();
     const ok = ctx.transport.send(toPeerId, {
@@ -376,12 +418,15 @@ function setupCli(ctx: CliCtx): void {
       ts: Date.now(),
     });
     if (!ok) {
+      // Fallo "inmediato": el send no encontró conexión. No tiene sentido
+      // esperar ACK porque ni siquiera salió de aquí.
       out(`✗ no entregado: sin conexión a ${shortId(toPeerId)}`);
       return;
     }
-    // Persistir saliente.
     void histAppend({ ts: Date.now(), dir: 'out', peerId: toPeerId, messageId, text });
-    // Programar timeout: si no llega ACK, marcar como no entregado.
+    // Timer "ACK o muerte". Si el peer remoto procesa el CHAT y responde
+    // a tiempo, handleMessage(CHAT_ACK) limpiará este timer. Si no, salta
+    // y limpiamos pendingAcks nosotros mismos para evitar fugas.
     const timer = setTimeout(() => {
       ctx.state.pendingAcks.delete(messageId);
       refresh(`\x1b[31m✗\x1b[0m ${messageId.slice(0, 8)} no entregado (timeout)`);

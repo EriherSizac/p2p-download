@@ -28,23 +28,34 @@ import { createHash, randomBytes } from 'node:crypto';
 // Tipos de mensaje (discriminantes numéricos).
 // ---------------------------------------------------------------------------
 
+// Discriminantes numéricos. Bloques organizados por "familia" — los hex no
+// son consecutivos a propósito: deja hueco para crecer en cada familia sin
+// reordenar (p.ej. añadir CHAT_EDIT entre CHAT_ACK y BYE rompería todos
+// los protocolos en producción; con huecos no).
 export const MSG = {
+  // ── Handshake + mensajería básica (0x01–0x04) ─────────────────────────
   HELLO: 0x01,
   CHAT: 0x02,
   /** Acuse de recibo de un CHAT. El emisor lo usa para mostrar ✓/✗ en UI. */
   CHAT_ACK: 0x03,
   BYE: 0x04,
+
+  // ── Liveness (0x05–0x06) ──────────────────────────────────────────────
   /** Heartbeat saliente: el receptor responde con PONG (mismo nonce). */
   PING: 0x05,
   /** Respuesta al PING; el emisor calcula RTT = ahora - ts del nonce. */
   PONG: 0x06,
-  /** Señalización WebRTC: oferta SDP del que inicia la llamada. */
+
+  // ── Señalización WebRTC (0x10–0x13) ───────────────────────────────────
+  // Ojo: SOLO viaja por aquí la SDP y los candidatos ICE. El audio real
+  // va por SRTP/UDP fuera de este protocolo (ver src/call.ts).
+  /** Oferta SDP del que inicia la llamada. */
   CALL_OFFER: 0x10,
-  /** Señalización WebRTC: respuesta SDP del que acepta la llamada. */
+  /** Respuesta SDP del que acepta la llamada. */
   CALL_ANSWER: 0x11,
-  /** Señalización WebRTC: candidato ICE individual (trickle). */
+  /** Un candidato ICE individual (trickle). `candidate: null` = fin. */
   CALL_ICE: 0x12,
-  /** Señalización WebRTC: rechazo, hangup o fallo. */
+  /** Rechazo, hangup o fallo. `reason` es informativo. */
   CALL_END: 0x13,
 } as const;
 
@@ -78,14 +89,25 @@ export const PROTOCOL_VERSION = 2;
 // Codec.
 // ---------------------------------------------------------------------------
 
+/**
+ * Serializa Message → Buffer. Formato: [type:u8][payload JSON].
+ * BYE no lleva payload — es solo el byte de tipo.
+ */
 export function encode(msg: Message): Buffer {
   const t = Buffer.from([msg.type]);
   if (msg.type === MSG.BYE) return t;
+  // Omitimos `type` del JSON; ya está en el primer byte. Si lo dejásemos
+  // duplicaría info y pagaríamos bytes en cada mensaje sin motivo.
   const { type: _omit, ...rest } = msg as Record<string, unknown>;
   void _omit;
   return Buffer.concat([t, Buffer.from(JSON.stringify(rest))]);
 }
 
+/**
+ * Deserializa Buffer → Message. Lanza si el tipo es desconocido — la capa
+ * de transporte usa esa excepción para cerrar el socket (mensaje basura
+ * = peer hostil o protocolo incompatible).
+ */
 export function decode(buf: Buffer): Message {
   if (buf.length < 1) throw new Error('Empty message');
   const type = buf[0] as MsgType;
@@ -93,7 +115,10 @@ export function decode(buf: Buffer): Message {
 
   switch (type) {
     case MSG.BYE:
+      // Sin payload — devolvemos directamente.
       return { type };
+    // Todos los demás tipos son JSON en el body. Cada uno tiene su forma
+    // pero el codec es el mismo: parse → { type, ...campos }.
     case MSG.HELLO:
     case MSG.CHAT:
     case MSG.CHAT_ACK:
