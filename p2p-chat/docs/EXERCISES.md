@@ -1,75 +1,89 @@
 # Ejercicios — p2p-chat
 
-El código del profesor está completo y funcional **excepto** los puntos
-marcados con `TODO(ALUMNO)`. Estos ejercicios extienden la mensajería.
+El código del profesor cubre mensajería completa (broadcast + directo + ACK +
+historial + RTT) y **llamadas de audio reales sobre WebRTC** usando `werift`
++ `ffmpeg`. Ver [ARCHITECTURE.md](ARCHITECTURE.md) para la explicación de
+cada pieza ya implementada.
 
-## Ejercicio 1 — Mensajería directa (obligatorio)
+Queda **un único ejercicio**: transferencia de archivos. Es deliberadamente
+abierto: integra lo aprendido en mensajería y señalización.
 
-**Objetivo**: implementar el comando `msg <peerId> <texto>` que envía un
-CHAT a un único peer (en lugar del broadcast de `chat`).
+## Ejercicio — Transferencia de archivos P2P
 
-**Archivos a tocar**: [src/main.ts](../src/main.ts) (case `'msg':`).
+**Objetivo**: enviar un fichero arbitrario de un peer a otro a través de la
+red P2P, con verificación de integridad y barra de progreso.
 
-**Pista**:
-- Usa `resolvePeer(prefix)` para resolver un prefijo a peerId completo.
-- Construye `{ type: MSG.CHAT, messageId: newMessageId(), text, ts: Date.now() }`.
-- `transport.send(peerId, msg)` devuelve `false` si no hay conexión —
-  notifícalo al usuario.
+**Comando esperado**:
 
-**Criterio de aceptación**: con tres peers conectados (A, B, C) un `msg <B>
-hola` desde A debe llegar solo a B; C no debe ver nada.
+```
+send <peerId> <ruta>      # emisor
+accept-file               # receptor — acepta el envío pendiente
+files                     # lista envíos en curso (entrantes y salientes)
+```
 
-## Ejercicio 2 — Acuse de recibo con timeout (intermedio)
+### Tarea mínima (obligatoria)
 
-**Objetivo**: garantizar que un CHAT ha sido recibido, o reportar fallo
-tras 3 s.
+1. Define cuatro mensajes nuevos en [src/protocol.ts](../src/protocol.ts):
 
-**Lo que añadir**:
+   | Tipo  | Nombre        | Payload                                                       |
+   |-------|---------------|---------------------------------------------------------------|
+   | 0x20  | FILE_OFFER    | `{transferId, name, size, sha256}`                            |
+   | 0x21  | FILE_ACCEPT   | `{transferId}` (o `FILE_REJECT` simétrico)                    |
+   | 0x22  | FILE_CHUNK    | `{transferId, seq, data: base64}`                             |
+   | 0x23  | FILE_DONE     | `{transferId}`                                                |
 
-1. En el receptor (handler `MSG.CHAT`): tras renderizar, responder con
-   `{ type: MSG.CHAT_ACK, messageId: msg.messageId }`.
-2. En el emisor: mantener `Map<messageId, {timer, peerId}>` por mensaje
-   enviado. Al recibir `CHAT_ACK`, limpiar el timer y mostrar `✓` en la UI;
-   si el timer dispara antes, mostrar `✗ no entregado`.
+2. Emisor: tras `FILE_OFFER`, espera `FILE_ACCEPT`. Lee el fichero en
+   bloques de 64 KB y mándalos como `FILE_CHUNK` con `seq` incremental.
+   Al terminar manda `FILE_DONE`.
 
-**Criterio de aceptación**:
-- Si ambos peers están vivos: el emisor ve `✓` instantáneo.
-- Si el receptor mata su proceso justo después de leer: el emisor ve `✗`
-  tras 3 s.
+3. Receptor: tras aceptar, abre un fichero destino en `./downloads/` y
+   acumula los chunks por `seq`. Cuando llega `FILE_DONE`, recalcula
+   SHA-256 y compara con el del OFFER. Si coincide, deja el fichero en
+   `./downloads/<name>`; si no, lo borra y avisa.
 
-**Extra**: pintar el mensaje enviado en gris hasta confirmarse, en blanco
-una vez confirmado.
+4. Muestra progreso (`bytes recibidos / total`) en el receptor cada 200 ms
+   sin romper el prompt — reutiliza el patrón `cliSinks.info` que ya usa
+   chat.
 
-## Ejercicio 3 — Historial persistente (intermedio)
+### Criterio de aceptación
 
-**Objetivo**: guardar todos los CHATs (enviados y recibidos) en un fichero
-`./history.jsonl` (un JSON por línea). Comando `history [n]` muestra los
-últimos `n` (default 20).
+- `send <peer> ./algo.bin` con `./algo.bin` de 5 MB completa en ambos peers
+  sin errores. SHA-256 verificado.
+- Si el receptor mata su proceso a la mitad, el emisor lo detecta (el
+  `transport.send` devuelve `false`) y cancela la transferencia limpiamente.
 
-**Pistas**:
-- Crear `src/history.ts` con `append(record)` y `tail(n)` usando
-  `fs.appendFile` / lectura por streams.
-- Registrar también el peerId del otro extremo y la dirección
-  (`in` / `out`).
+### Bonus (intermedio)
 
-## Ejercicio 4 — PING/PONG y latencia (avanzado)
+- **Backpressure**: si `transport.send` devuelve `false` por buffer lleno,
+  pausa la lectura del fichero (`stream.pause()`) y reanuda en `'drain'`.
+- **Multiplexing**: que dos transferencias simultáneas no se interrumpan.
+  Ya tienes `transferId` para distinguirlas.
+- **Resume**: si la conexión cae a mitad, al reconectarse el receptor anuncia
+  `FILE_RESUME(transferId, byteOffset)` y el emisor reanuda desde ahí.
 
-**Objetivo**: medir el round-trip a cada peer y mostrarlo en `peers`.
+### Bonus (avanzado): usar un DataChannel WebRTC
 
-**Lo que añadir**:
+El proyecto ya tiene WebRTC montado para audio. Un `RTCDataChannel`
+viaja por el mismo transporte SRTP/UDP que el audio y es mucho más
+rápido que TCP para LAN/WAN con NAT. Pista:
 
-1. Tipos `PING = 0x05`, `PONG = 0x06` con payload `{nonce: number}`.
-2. Cada 5 s, cada peer envía un PING a cada conexión activa. Al recibir
-   PING se responde con PONG (mismo nonce).
-3. Mantener un EWMA (media móvil exponencial) de RTT por peer.
-4. Mostrar el RTT en `peers` y `who`.
+```ts
+// En src/call.ts — durante setupPeerConnection
+const dc = pc.createDataChannel('files', { ordered: true });
+dc.onMessage.subscribe((msg) => /* recibir chunks */);
+dc.send(chunkBuffer);
+```
 
----
+Reutiliza la señalización CALL_OFFER/ANSWER/ICE para abrir el peer
+connection cuando no haya llamada activa, o multiplexa el datachannel
+sobre una llamada existente.
 
 ## Reglas
 
-- No introduzcas dependencias nuevas.
-- Cuando añadas un tipo de mensaje, actualiza
+- No introduzcas dependencias nuevas más allá de las que ya hay en
+  `package.json` (mensajería sigue usando solo módulos nativos; WebRTC
+  ya está cubierto por `werift`).
+- Cuando añadas un tipo de mensaje, **actualiza**
   [docs/PROTOCOL.md](PROTOCOL.md).
 - Nada de mezclar lógica con `p2p-files`. Si quieres reutilizar algo,
   cópialo: este repo está deliberadamente desacoplado.
