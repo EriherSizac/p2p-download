@@ -1,12 +1,21 @@
+// File: MAIN — orquestación de capas + CLI (chat + llamadas)
+// Created: 2026-05-13
+// Updated: 2026-05-13
+// Author: Erick Hernández Silva
+
 /**
- * MAIN — orquestación de capas + CLI (chat)
- * -----------------------------------------
- * Junta las 4 capas (descubrimiento → transporte → framing → protocolo) y
- * expone una CLI sobre `readline` enfocada en mensajería peer-to-peer.
+ * MAIN — orquestación de capas + CLI (chat + llamadas)
+ * ----------------------------------------------------
+ * Junta las 5 capas:
+ *   1) Descubrimiento (UDP broadcast)
+ *   2) Transporte    (TCP + pool)
+ *   3) Framing       (length-prefix)
+ *   4) Protocolo     (HELLO, CHAT, CHAT_ACK, PING/PONG, CALL_OFFER/ANSWER/ICE/END, BYE)
+ *   5) Llamadas A/V  (WebRTC vía werift, señalizada por la 4)
  *
- * Este proyecto es deliberadamente independiente de `p2p-files`: comparte la
- * estructura por capas pero no la implementación, para que el alumno pueda
- * estudiar cada uno por separado sin saltar entre carpetas.
+ * y expone una CLI sobre `readline`. Este proyecto es deliberadamente
+ * independiente de `p2p-files`: comparte la estructura por capas pero no la
+ * implementación.
  */
 
 import readline from 'node:readline';
@@ -15,11 +24,14 @@ import { Transport } from './transport.js';
 import {
   generatePeerId,
   newMessageId,
+  newCallId,
   shortId,
   MSG,
   type Message,
 } from './protocol.js';
 import { createLogger } from './logger.js';
+import { append as histAppend, tail as histTail, filePath as histPath } from './history.js';
+import { Call } from './call.js';
 
 const log = createLogger('main');
 
@@ -27,6 +39,28 @@ const TCP_PORT = Number(process.env['TCP_PORT'] ?? 0);
 // Puerto distinto al de p2p-files (41234) para que ambos puedan coexistir
 // en la misma LAN sin confundir sus enjambres.
 const DISCOVERY_PORT = Number(process.env['DISCOVERY_PORT'] ?? 41235);
+
+// Acuse de recibo: cuánto esperamos antes de declarar un CHAT como ✗ no entregado.
+const CHAT_ACK_TIMEOUT_MS = 3_000;
+
+// PING/PONG: con qué frecuencia medimos RTT por peer.
+const PING_INTERVAL_MS = 5_000;
+// Coeficiente del EWMA (media móvil exponencial). 0.2 = el nuevo valor pesa
+// 20%, el histórico 80% → suaviza picos transitorios.
+const RTT_EWMA_ALPHA = 0.2;
+
+interface PendingAck {
+  peerId: string;
+  timer: NodeJS.Timeout;
+  shortMsgId: string;
+}
+
+interface PeerLiveness {
+  /** RTT estimado en ms (EWMA). undefined hasta el primer PONG. */
+  rttMs?: number;
+  /** PINGs enviados aún sin respuesta. Key=nonce, value=ts envío. */
+  pendingPings: Map<number, number>;
+}
 
 async function bootstrap(): Promise<void> {
   const peerId = generatePeerId();
@@ -39,8 +73,12 @@ async function bootstrap(): Promise<void> {
   await discovery.start();
 
   // Sink que setupCli rellena al construir readline; usado desde handleMessage
-  // para imprimir chats entrantes sin romper el prompt.
-  const cliSinks: { chat?: (from: string, text: string) => void } = {};
+  // para imprimir eventos sin romper el prompt.
+  const cliSinks: {
+    chat?: (from: string, text: string) => void;
+    ack?: (messageId: string, from: string) => void;
+    info?: (text: string) => void;
+  } = {};
 
   // Tie-break lexicográfico: solo el peerId menor inicia conexión saliente,
   // así evitamos sockets duplicados cuando ambos se descubren a la vez.
@@ -48,8 +86,30 @@ async function bootstrap(): Promise<void> {
     if (peerId < p.peerId) transport.connect(p.peerId, p.host, p.port);
   });
 
+  // Estado para Ej2 (ACK con timeout) y Ej4 (RTT EWMA).
+  const pendingAcks = new Map<string, PendingAck>();
+  const liveness = new Map<string, PeerLiveness>();
+
+  // Estado de llamadas activas. Solo una concurrente por peer remoto (simple).
+  const calls = new Map<string, Call>(); // callId → Call
+  const callsByPeer = new Map<string, string>(); // peerId → callId
+
+  // ---------------------------------------------------------------------
+  // Manejo de mensajes entrantes.
+  // ---------------------------------------------------------------------
+
   transport.on('message', (from, msg: Message) => {
     handleMessage(from, msg);
+  });
+
+  transport.on('peer-disconnected', (pid) => {
+    liveness.delete(pid);
+    // Si había una llamada activa con ese peer, cerrarla limpiamente.
+    const cid = callsByPeer.get(pid);
+    if (cid) {
+      const call = calls.get(cid);
+      if (call) void call.closeFromRemote('peer-disconnected');
+    }
   });
 
   function handleMessage(from: string, msg: Message): void {
@@ -57,25 +117,170 @@ async function bootstrap(): Promise<void> {
       case MSG.BYE:
         log.debug(`bye de ${shortId(from)}`);
         break;
-      case MSG.CHAT:
+
+      case MSG.CHAT: {
         cliSinks.chat?.(from, msg.text);
-        // TODO(ALUMNO): responder con CHAT_ACK al emisor.
-        // Pista: transport.send(from, { type: MSG.CHAT_ACK, messageId: msg.messageId });
+        // Acuse de recibo (Ej2): inmediato tras renderizar.
+        transport.send(from, { type: MSG.CHAT_ACK, messageId: msg.messageId });
+        // Persistir en historial (Ej3).
+        void histAppend({
+          ts: msg.ts,
+          dir: 'in',
+          peerId: from,
+          messageId: msg.messageId,
+          text: msg.text,
+        });
         break;
-      case MSG.CHAT_ACK:
-        // TODO(ALUMNO): correlacionar el ACK con el messageId pendiente y
-        // marcar el mensaje como entregado en la UI.
-        log.debug(`ack ${msg.messageId} de ${shortId(from)}`);
+      }
+
+      case MSG.CHAT_ACK: {
+        const pending = pendingAcks.get(msg.messageId);
+        if (!pending) {
+          log.debug(`ack ${msg.messageId} sin pendiente — ignorado`);
+          break;
+        }
+        clearTimeout(pending.timer);
+        pendingAcks.delete(msg.messageId);
+        cliSinks.ack?.(msg.messageId, from);
         break;
+      }
+
+      case MSG.PING:
+        // Respuesta inmediata con el mismo nonce.
+        transport.send(from, { type: MSG.PONG, nonce: msg.nonce });
+        break;
+
+      case MSG.PONG: {
+        const liv = liveness.get(from);
+        if (!liv) break;
+        const sentAt = liv.pendingPings.get(msg.nonce);
+        if (sentAt === undefined) break;
+        liv.pendingPings.delete(msg.nonce);
+        const rtt = Date.now() - sentAt;
+        liv.rttMs = liv.rttMs === undefined
+          ? rtt
+          : RTT_EWMA_ALPHA * rtt + (1 - RTT_EWMA_ALPHA) * liv.rttMs;
+        break;
+      }
+
+      case MSG.CALL_OFFER: {
+        if (callsByPeer.has(from)) {
+          // Ya hay una llamada con este peer. Rechazar la nueva.
+          transport.send(from, { type: MSG.CALL_END, callId: msg.callId, reason: 'busy' });
+          break;
+        }
+        cliSinks.info?.(`\x1b[33m📞 llamada entrante de ${shortId(from)}\x1b[0m`);
+        cliSinks.info?.('   usa `answer` para aceptar o `hangup` para rechazar');
+        // Aún no construimos el Call: esperamos a que el usuario haga `answer`.
+        // Guardamos la oferta pendiente.
+        pendingIncomingOffer = { callId: msg.callId, from, sdp: msg.sdp };
+        break;
+      }
+
+      case MSG.CALL_ANSWER: {
+        const call = calls.get(msg.callId);
+        if (!call) {
+          log.warn(`CALL_ANSWER para callId desconocido: ${msg.callId}`);
+          break;
+        }
+        void call.onAnswer(msg.sdp);
+        break;
+      }
+
+      case MSG.CALL_ICE: {
+        const call = calls.get(msg.callId);
+        if (!call) break;
+        void call.onIce(msg.candidate);
+        break;
+      }
+
+      case MSG.CALL_END: {
+        const call = calls.get(msg.callId);
+        if (call) void call.closeFromRemote(msg.reason);
+        if (pendingIncomingOffer && pendingIncomingOffer.callId === msg.callId) {
+          cliSinks.info?.(`📞 ${shortId(from)} canceló la llamada (${msg.reason ?? '?'})`);
+          pendingIncomingOffer = undefined;
+        }
+        break;
+      }
+
       default:
         break;
     }
   }
 
-  setupCli({ discovery, transport, peerId, sinks: cliSinks });
+  // Oferta entrante pendiente de aceptación (un peer puede tener solo una).
+  let pendingIncomingOffer: { callId: string; from: string; sdp: string } | undefined;
+
+  // ---------------------------------------------------------------------
+  // Timer de PING/PONG: por cada peer conectado, mandar un PING y dejarlo
+  // pendiente hasta el PONG. Si el peer no responde, el nonce se queda en
+  // pendingPings; no hace daño, el siguiente ciclo machaca su entrada.
+  // ---------------------------------------------------------------------
+
+  let nextNonce = 1;
+  const pingTimer = setInterval(() => {
+    for (const pid of transport.connectedPeers()) {
+      let liv = liveness.get(pid);
+      if (!liv) {
+        liv = { pendingPings: new Map() };
+        liveness.set(pid, liv);
+      }
+      const nonce = nextNonce++;
+      liv.pendingPings.set(nonce, Date.now());
+      transport.send(pid, { type: MSG.PING, nonce });
+    }
+  }, PING_INTERVAL_MS);
+
+  // ---------------------------------------------------------------------
+  // Helper de llamadas: monta el cableado entre Call y transport.
+  // ---------------------------------------------------------------------
+
+  function spawnCall(opts: { remotePeerId: string; callId: string; role: 'caller' | 'callee'; source?: string }): Call {
+    const call = new Call({
+      callId: opts.callId,
+      remotePeerId: opts.remotePeerId,
+      role: opts.role,
+      source: opts.source,
+      playback: process.env['CALL_PLAYBACK'] !== '0',
+      signal: (m) => {
+        if (m.type === 'offer') transport.send(opts.remotePeerId, { type: MSG.CALL_OFFER, callId: opts.callId, sdp: m.sdp });
+        else if (m.type === 'answer') transport.send(opts.remotePeerId, { type: MSG.CALL_ANSWER, callId: opts.callId, sdp: m.sdp });
+        else if (m.type === 'ice') transport.send(opts.remotePeerId, { type: MSG.CALL_ICE, callId: opts.callId, candidate: m.candidate });
+        else if (m.type === 'end') transport.send(opts.remotePeerId, { type: MSG.CALL_END, callId: opts.callId, reason: m.reason });
+      },
+    });
+    calls.set(opts.callId, call);
+    callsByPeer.set(opts.remotePeerId, opts.callId);
+
+    call.on('state', (s) => {
+      cliSinks.info?.(`📞 llamada ${opts.callId} → ${s}`);
+    });
+    call.on('ended', (reason) => {
+      calls.delete(opts.callId);
+      callsByPeer.delete(opts.remotePeerId);
+      cliSinks.info?.(`📞 llamada ${opts.callId} terminada (${reason ?? '?'})`);
+    });
+    return call;
+  }
+
+  setupCli({
+    discovery,
+    transport,
+    peerId,
+    sinks: cliSinks,
+    state: { pendingAcks, liveness, calls, callsByPeer },
+    pending: {
+      get incomingOffer() { return pendingIncomingOffer; },
+      clear() { pendingIncomingOffer = undefined; },
+    },
+    spawnCall,
+  });
 
   const shutdown = (): void => {
     log.info('cerrando…');
+    clearInterval(pingTimer);
+    for (const call of calls.values()) void call.closeFromRemote('shutdown');
     transport.broadcast({ type: MSG.BYE });
     discovery.stop();
     transport.stop();
@@ -89,7 +294,22 @@ interface CliCtx {
   discovery: Discovery;
   transport: Transport;
   peerId: string;
-  sinks: { chat?: (from: string, text: string) => void };
+  sinks: {
+    chat?: (from: string, text: string) => void;
+    ack?: (messageId: string, from: string) => void;
+    info?: (text: string) => void;
+  };
+  state: {
+    pendingAcks: Map<string, PendingAck>;
+    liveness: Map<string, PeerLiveness>;
+    calls: Map<string, Call>;
+    callsByPeer: Map<string, string>;
+  };
+  pending: {
+    readonly incomingOffer: { callId: string; from: string; sdp: string } | undefined;
+    clear(): void;
+  };
+  spawnCall(opts: { remotePeerId: string; callId: string; role: 'caller' | 'callee'; source?: string }): Call;
 }
 
 function setupCli(ctx: CliCtx): void {
@@ -100,21 +320,36 @@ function setupCli(ctx: CliCtx): void {
     process.stdout.write(s.endsWith('\n') ? s : s + '\n');
   };
 
-  const printMenu = (): void => {
-    out('');
-    out('  ┌─ menú · p2p-chat ────────────────────────────────────┐');
-    out('  │  chat <texto>          difunde mensaje a todos       │');
-    out('  │  msg <peerId> <texto>  mensaje directo (ejercicio)   │');
-    out('  │  peers                 peers descubiertos            │');
-    out('  │  who                   peers conectados (handshake)  │');
-    out('  │  menu | help | quit                                  │');
-    out('  └──────────────────────────────────────────────────────┘');
+  const refresh = (line: string): void => {
+    process.stdout.write('\r\x1b[K');
+    process.stdout.write(line);
+    if (!line.endsWith('\n')) process.stdout.write('\n');
+    rl.prompt(true);
   };
 
-  ctx.sinks.chat = (from: string, text: string): void => {
-    process.stdout.write('\r\x1b[K');
-    process.stdout.write(`\x1b[35m[chat][${shortId(from)}]\x1b[0m ${text}\n`);
-    rl.prompt(true);
+  const printMenu = (): void => {
+    out('');
+    out('  ┌─ menú · p2p-chat ────────────────────────────────────────┐');
+    out('  │  chat <texto>             difunde mensaje a todos        │');
+    out('  │  msg <peerId> <texto>     mensaje directo (con ACK ✓/✗)  │');
+    out('  │  history [n]              últimos n mensajes (default 20)│');
+    out('  │  peers                    peers descubiertos + RTT       │');
+    out('  │  who                      peers conectados + RTT         │');
+    out('  │  call <peerId> [source]   llamar (source=tone|mic|file:…)│');
+    out('  │  answer                   aceptar llamada entrante       │');
+    out('  │  hangup                   colgar llamada activa          │');
+    out('  │  menu | help | quit                                      │');
+    out('  └──────────────────────────────────────────────────────────┘');
+  };
+
+  ctx.sinks.chat = (from, text) => {
+    refresh(`\x1b[35m[chat][${shortId(from)}]\x1b[0m ${text}`);
+  };
+  ctx.sinks.ack = (messageId) => {
+    refresh(`\x1b[32m✓\x1b[0m ${messageId.slice(0, 8)} entregado`);
+  };
+  ctx.sinks.info = (text) => {
+    refresh(text);
   };
 
   printMenu();
@@ -126,69 +361,161 @@ function setupCli(ctx: CliCtx): void {
     return matches.length === 1 ? matches[0] : undefined;
   };
 
+  const fmtRtt = (peerId: string): string => {
+    const liv = ctx.state.liveness.get(peerId);
+    if (!liv || liv.rttMs === undefined) return '—';
+    return `${liv.rttMs.toFixed(1)} ms`;
+  };
+
+  const sendChat = (toPeerId: string, text: string): void => {
+    const messageId = newMessageId();
+    const ok = ctx.transport.send(toPeerId, {
+      type: MSG.CHAT,
+      messageId,
+      text,
+      ts: Date.now(),
+    });
+    if (!ok) {
+      out(`✗ no entregado: sin conexión a ${shortId(toPeerId)}`);
+      return;
+    }
+    // Persistir saliente.
+    void histAppend({ ts: Date.now(), dir: 'out', peerId: toPeerId, messageId, text });
+    // Programar timeout: si no llega ACK, marcar como no entregado.
+    const timer = setTimeout(() => {
+      ctx.state.pendingAcks.delete(messageId);
+      refresh(`\x1b[31m✗\x1b[0m ${messageId.slice(0, 8)} no entregado (timeout)`);
+    }, CHAT_ACK_TIMEOUT_MS);
+    ctx.state.pendingAcks.set(messageId, { peerId: toPeerId, timer, shortMsgId: messageId.slice(0, 8) });
+  };
+
   rl.on('line', (line) => {
     const [cmd, ...rest] = line.trim().split(/\s+/);
-    try {
-      switch (cmd) {
-        case '':
-          break;
-        case 'peers': {
-          const list = ctx.discovery.list();
-          if (list.length === 0) { out('(no hay peers descubiertos)'); break; }
-          for (const p of list) {
-            const conn = ctx.transport.isConnected(p.peerId) ? 'conectado' : 'descubierto';
-            out(`  ${shortId(p.peerId)}  ${p.host}:${p.port}  ${conn}`);
+    void (async () => {
+      try {
+        switch (cmd) {
+          case '':
+            break;
+
+          case 'peers': {
+            const list = ctx.discovery.list();
+            if (list.length === 0) { out('(no hay peers descubiertos)'); break; }
+            for (const p of list) {
+              const conn = ctx.transport.isConnected(p.peerId) ? 'conectado' : 'descubierto';
+              out(`  ${shortId(p.peerId)}  ${p.host}:${p.port}  ${conn}  rtt=${fmtRtt(p.peerId)}`);
+            }
+            break;
           }
-          break;
+
+          case 'who': {
+            const ids = ctx.transport.connectedPeers();
+            if (ids.length === 0) { out('(sin peers conectados)'); break; }
+            for (const id of ids) out(`  ${shortId(id)}  rtt=${fmtRtt(id)}`);
+            break;
+          }
+
+          case 'chat': {
+            const text = rest.join(' ');
+            if (!text) { out('uso: chat <texto>'); break; }
+            const connected = ctx.transport.connectedPeers();
+            if (connected.length === 0) { out('no hay peers conectados'); break; }
+            // Broadcast: enviamos por separado a cada peer para que cada uno
+            // genere su propio ACK; el messageId se comparte entre todos.
+            const messageId = newMessageId();
+            const ts = Date.now();
+            for (const id of connected) {
+              ctx.transport.send(id, { type: MSG.CHAT, messageId, text, ts });
+            }
+            void histAppend({ ts, dir: 'out', peerId: 'broadcast', messageId, text });
+            out(`(chat) → ${connected.length} peer(s)`);
+            break;
+          }
+
+          case 'msg': {
+            const prefix = rest[0];
+            const text = rest.slice(1).join(' ');
+            if (!prefix || !text) { out('uso: msg <peerId> <texto>'); break; }
+            const target = resolvePeer(prefix);
+            if (!target) { out(`peerId ambiguo o desconocido: ${prefix}`); break; }
+            if (!ctx.transport.isConnected(target)) { out(`no hay conexión activa con ${shortId(target)}`); break; }
+            sendChat(target, text);
+            break;
+          }
+
+          case 'history': {
+            const n = Number(rest[0] ?? 20);
+            const recs = await histTail(Number.isFinite(n) && n > 0 ? n : 20);
+            if (recs.length === 0) { out(`(historial vacío — ${histPath()})`); break; }
+            for (const r of recs) {
+              const arrow = r.dir === 'out' ? '→' : '←';
+              const who = r.peerId === 'broadcast' ? '*all*' : shortId(r.peerId);
+              const t = new Date(r.ts).toISOString().slice(11, 19);
+              out(`  ${t} ${arrow} ${who}  ${r.text}`);
+            }
+            break;
+          }
+
+          case 'call': {
+            const prefix = rest[0];
+            const source = rest[1] ?? 'tone';
+            if (!prefix) { out('uso: call <peerId> [tone|mic|mic:<spec>|file:<ruta>]'); break; }
+            const target = resolvePeer(prefix);
+            if (!target) { out(`peerId ambiguo o desconocido: ${prefix}`); break; }
+            if (!ctx.transport.isConnected(target)) { out(`no hay conexión activa con ${shortId(target)}`); break; }
+            if (ctx.state.callsByPeer.has(target)) { out(`ya hay una llamada con ${shortId(target)}`); break; }
+            const callId = newCallId();
+            const call = ctx.spawnCall({ remotePeerId: target, callId, role: 'caller', source });
+            await call.start();
+            out(`📞 llamando a ${shortId(target)} (callId=${callId}, fuente=${source})`);
+            break;
+          }
+
+          case 'answer': {
+            const offer = ctx.pending.incomingOffer;
+            if (!offer) { out('no hay llamadas entrantes pendientes'); break; }
+            if (ctx.state.callsByPeer.has(offer.from)) { out(`ya hay una llamada con ${shortId(offer.from)}`); break; }
+            const source = rest[0] ?? 'tone';
+            const call = ctx.spawnCall({ remotePeerId: offer.from, callId: offer.callId, role: 'callee', source });
+            ctx.pending.clear();
+            await call.accept(offer.sdp);
+            out(`📞 aceptada (callId=${offer.callId}, fuente=${source})`);
+            break;
+          }
+
+          case 'hangup': {
+            if (ctx.pending.incomingOffer) {
+              const o = ctx.pending.incomingOffer;
+              ctx.transport.send(o.from, { type: MSG.CALL_END, callId: o.callId, reason: 'rejected' });
+              ctx.pending.clear();
+              out('📞 llamada entrante rechazada');
+              break;
+            }
+            if (ctx.state.calls.size === 0) { out('no hay llamadas activas'); break; }
+            for (const call of ctx.state.calls.values()) {
+              await call.hangup('user');
+            }
+            break;
+          }
+
+          case 'menu':
+            printMenu();
+            break;
+          case 'quit':
+          case 'exit':
+            rl.close();
+            process.kill(process.pid, 'SIGINT');
+            return;
+          case 'help':
+            out('comandos: peers | who | chat <texto> | msg <peerId> <texto> | history [n] | call <peerId> [source] | answer | hangup | menu | quit');
+            break;
+          default:
+            out(`comando desconocido: ${cmd}`);
         }
-        case 'who': {
-          const ids = ctx.transport.connectedPeers();
-          if (ids.length === 0) { out('(sin peers conectados)'); break; }
-          for (const id of ids) out(`  ${shortId(id)}`);
-          break;
-        }
-        case 'chat': {
-          const text = rest.join(' ');
-          if (!text) { out('uso: chat <texto>'); break; }
-          const connected = ctx.transport.connectedPeers();
-          if (connected.length === 0) { out('no hay peers conectados'); break; }
-          ctx.transport.broadcast({
-            type: MSG.CHAT,
-            messageId: newMessageId(),
-            text,
-            ts: Date.now(),
-          });
-          out(`(chat) → ${connected.length} peer(s)`);
-          break;
-        }
-        case 'msg': {
-          // TODO(ALUMNO): mensajería directa 1-a-1.
-          // - Validar rest[0] como prefijo de peerId conectado (resolvePeer).
-          // - Construir Message CHAT con messageId nuevo, text, ts.
-          // - transport.send(peerId, msg). Si false, avisar.
-          // - Bonus: esperar CHAT_ACK con timeout y mostrar ✓/✗.
-          out('(msg) ejercicio para alumnos — ver docs/EXERCISES.md');
-          void resolvePeer;
-          break;
-        }
-        case 'menu':
-          printMenu();
-          break;
-        case 'quit':
-        case 'exit':
-          rl.close();
-          process.kill(process.pid, 'SIGINT');
-          return;
-        case 'help':
-          out('comandos: peers | who | chat <texto> | msg <peerId> <texto> | menu | quit');
-          break;
-        default:
-          out(`comando desconocido: ${cmd}`);
+      } catch (err) {
+        out(`error: ${(err as Error).message}`);
       }
-    } catch (err) {
-      out(`error: ${(err as Error).message}`);
-    }
-    rl.prompt();
+      rl.prompt();
+    })();
   });
 }
 
