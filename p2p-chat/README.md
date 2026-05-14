@@ -68,4 +68,5 @@ menu | help | quit
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — las 5 capas y flujo de chat + llamada.
 - [docs/PROTOCOL.md](docs/PROTOCOL.md) — tabla de mensajes (mensajería + señalización WebRTC).
 - [docs/EXERCISES.md](docs/EXERCISES.md) — el único ejercicio: transferencia de archivos.
+- [docs/notebooks/](docs/notebooks/) — **4 Jupyter notebooks** que explican cada capa con diagramas, simulaciones ejecutables y plots (EWMA, parser de frames, RTP). Recomendado leerlos antes de tocar el código.
 - [../docs/NAT.md](../docs/NAT.md) — limitaciones de descubrimiento UDP y por qué STUN sí pero TURN no.

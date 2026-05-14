@@ -3,6 +3,9 @@
 Cinco capas independientes; cada una resuelve **un único problema** y es
 agnóstica de las superiores. La separación es deliberadamente pedagógica.
 
+> 💡 Para una explicación capa a capa con diagramas + simulaciones, ver
+> [docs/notebooks/](notebooks/) (4 Jupyter notebooks).
+
 ## Vista general
 
 ```
