@@ -1,12 +1,13 @@
 # Notebooks — p2p-chat
 
-Cuatro notebooks Jupyter que explican el proyecto **capa por capa**, con
+Cinco notebooks Jupyter que explican el proyecto **capa por capa**, con
 diagramas, simulaciones ejecutables y referencias cruzadas al código.
 
 Recomendado leerlos en orden:
 
 | # | Notebook | Contenido |
 |---|----------|-----------|
+| 00 | [Broadcast y grafo de descubrimiento](00-broadcast-y-grafo.ipynb) | Intro interactiva: elige tu peerId, simula broadcast UDP, visualiza el grafo de conectividad |
 | 01 | [Descubrimiento y Transporte](01-descubrimiento-y-transporte.ipynb) | UDP broadcast, GC de peers, TCP pool, tie-break, handshake HELLO |
 | 02 | [Framing y Protocolo](02-framing-y-protocolo.ipynb) | length-prefix vs separadores, parser stateful, tabla de tipos, codec |
 | 03 | [Mensajería avanzada](03-mensajeria-ack-history-rtt.ipynb) | CHAT_ACK con timeout, JSONL append, PING/PONG, **EWMA con plots** |
@@ -15,7 +16,7 @@ Recomendado leerlos en orden:
 ## Requisitos
 
 ```bash
-pip install jupyter matplotlib
+pip install jupyter matplotlib networkx
 jupyter notebook
 ```
 
