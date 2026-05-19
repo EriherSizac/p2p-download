@@ -1,3 +1,8 @@
+// File: MEDIA — captura y reproducción de audio con ffmpeg/ffplay.
+// Created: 2026-05-19
+// Updated: 2026-05-19
+// Author: Erick Hernández Silva
+
 /**
  * MEDIA — captura y reproducción de audio con ffmpeg/ffplay.
  *
@@ -116,23 +121,35 @@ function detectDefaultWindowsMic(): string {
   // ffmpeg sale con código != 0 al fallar el `-i dummy`, pero la lista
   // ya está en stderr. Por eso no chequeamos status.
   const stderr = result.stderr ?? '';
-  // Estado: false = todavía en sección vídeo, true = ya en audio.
-  let inAudioSection = false;
   let firstAudio: string | undefined;
+
+  // Formato nuevo (ffmpeg ≥ ~6): cada línea lleva el tipo inline → "Nombre" (audio)
+  // Formato viejo: secciones "DirectShow audio devices" / "DirectShow video devices"
+  // Intentamos el nuevo primero; si no hay matches caemos al viejo.
   for (const line of stderr.split(/\r?\n/)) {
-    if (/DirectShow\s+audio\s+devices/i.test(line)) { inAudioSection = true; continue; }
-    if (/DirectShow\s+video\s+devices/i.test(line)) { inAudioSection = false; continue; }
-    if (!inAudioSection) continue;
-    // Líneas con dispositivos llevan el nombre entre comillas dobles.
-    // Saltamos las líneas "Alternative name" (usan el GUID interno).
     if (/Alternative name/i.test(line)) continue;
-    const m = line.match(/"([^"]+)"/);
+    const m = line.match(/"([^"]+)"\s*\(audio\)/i);
     if (m) { firstAudio = m[1]; break; }
   }
+
+  if (!firstAudio) {
+    // Fallback: formato con secciones.
+    let inAudioSection = false;
+    for (const line of stderr.split(/\r?\n/)) {
+      if (/DirectShow\s+audio\s+devices/i.test(line)) { inAudioSection = true; continue; }
+      if (/DirectShow\s+video\s+devices/i.test(line)) { inAudioSection = false; continue; }
+      if (!inAudioSection) continue;
+      if (/Alternative name/i.test(line)) continue;
+      const m = line.match(/"([^"]+)"/);
+      if (m) { firstAudio = m[1]; break; }
+    }
+  }
+
   if (!firstAudio) {
     throw new Error(
       'No se encontró ningún dispositivo de audio DirectShow. ' +
-        'Conecta un mic o pasa uno explícito: `call <peer> mic:audio=<nombre>`.',
+        'Conecta un mic o pasa uno explícito: `call <peer> mic:audio=<nombre>`.\n' +
+        `Salida ffmpeg:\n${stderr.slice(0, 800)}`,
     );
   }
   cachedWinMic = firstAudio;
