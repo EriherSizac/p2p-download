@@ -238,9 +238,12 @@ async function bootstrap(): Promise<void> {
         return { ok: true };
       },
       peerInfo(peerId: string) {
-        const sharedFiles = remoteCatalog.get(peerId)?.length ?? 0;
-        // Downloads activas globales — no podemos filtrar por peer porque
-        // el scheduler no expone esa relación. Mostramos todo.
+        const isMe = peerId === ctx_peerId();
+        // Si soy yo, "sharedFiles" = mi catálogo local. Si es remoto,
+        // los que tengamos cacheados (vía LIST_REPLY previo).
+        const sharedFiles = isMe
+          ? index.list().length
+          : remoteCatalog.get(peerId)?.length ?? 0;
         const downloads = scheduler.status().map((d) => ({
           fileId: '',
           name: d.name,
@@ -250,11 +253,54 @@ async function bootstrap(): Promise<void> {
         }));
         return {
           peerId,
-          isMe: peerId === ctx_peerId(),
+          isMe,
           isConnected: transport.isConnected(peerId),
           sharedFiles,
           downloads,
         };
+      },
+      myFiles() {
+        return index.list().map((f) => ({
+          fileId: f.fileId,
+          name: f.name,
+          size: f.size,
+          numPieces: f.numPieces,
+        }));
+      },
+      async share(absPath: string) {
+        try {
+          const manifest = await index.addPath(absPath);
+          // Anunciamos el nuevo archivo con bitfield completo (lo tenemos todo).
+          const numBytes = Math.ceil(manifest.numPieces / 8);
+          const full = Buffer.alloc(numBytes);
+          for (let i = 0; i < manifest.numPieces; i++) {
+            full[i >> 3] = (full[i >> 3] ?? 0) | (1 << (7 - (i & 7)));
+          }
+          transport.broadcast({
+            type: MSG.HAVE,
+            fileId: manifest.fileId,
+            bitfield: full.toString('base64'),
+          });
+          // Snapshot refleja "nodo mío" con +1 archivo compartido.
+          pushSnapshot();
+          return {
+            ok: true,
+            file: {
+              fileId: manifest.fileId,
+              name: manifest.name,
+              size: manifest.size,
+              numPieces: manifest.numPieces,
+            },
+          };
+        } catch (err) {
+          return { ok: false, error: (err as Error).message };
+        }
+      },
+      unshare(name: string) {
+        const ok = index.removeExternal(name);
+        if (!ok) return { ok: false, error: 'no encontrado o no es archivo externo (los del SHARED_DIR no se quitan así)' };
+        pushSnapshot();
+        return { ok: true };
       },
     };
   }

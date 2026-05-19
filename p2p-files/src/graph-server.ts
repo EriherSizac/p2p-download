@@ -53,6 +53,12 @@ export interface GraphActions {
     sharedFiles: number;     // archivos que SABEMOS que este peer tiene
     downloads: DownloadProgress[]; // descargas en curso que nos interesan
   };
+  /** Lista de archivos locales que YO comparto. */
+  myFiles(): RemoteFileSummary[];
+  /** Comparte un archivo por ruta absoluta. Hashea + anuncia HAVE. */
+  share(absPath: string): Promise<{ ok: boolean; error?: string; file?: RemoteFileSummary }>;
+  /** Quita un archivo de mi catálogo por nombre. No borra el fichero. */
+  unshare(name: string): { ok: boolean; error?: string };
 }
 
 /** Eventos push al navegador. */
@@ -151,6 +157,12 @@ export class GraphServer {
       { void this.handleListRemote(url, res); return; }
     if (url === '/api/download' && req.method === 'POST')
       { void this.handleDownload(req, res); return; }
+    if (url === '/api/my-files' && req.method === 'GET')
+      { this.handleMyFiles(res); return; }
+    if (url === '/api/share' && req.method === 'POST')
+      { void this.handleShare(req, res); return; }
+    if (url === '/api/unshare' && req.method === 'POST')
+      { void this.handleUnshare(req, res); return; }
 
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(PAGE_HTML);
@@ -229,6 +241,37 @@ export class GraphServer {
       if (!fileId) return this.json(res, 400, { ok: false, error: 'fileId required' });
       const r = await this.actions.download(fileId);
       this.json(res, r.ok ? 200 : 502, r);
+    } catch (err) {
+      this.json(res, 400, { ok: false, error: (err as Error).message });
+    }
+  }
+
+  private handleMyFiles(res: http.ServerResponse): void {
+    if (!this.actions) return this.json(res, 503, { ok: false, error: 'actions not wired' });
+    this.json(res, 200, { ok: true, files: this.actions.myFiles() });
+  }
+
+  private async handleShare(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    if (!this.actions) return this.json(res, 503, { ok: false, error: 'actions not wired' });
+    try {
+      const body = await this.readJson(req);
+      const p = String(body['path'] ?? '').trim();
+      if (!p) return this.json(res, 400, { ok: false, error: 'path required' });
+      const r = await this.actions.share(p);
+      this.json(res, r.ok ? 200 : 400, r);
+    } catch (err) {
+      this.json(res, 400, { ok: false, error: (err as Error).message });
+    }
+  }
+
+  private async handleUnshare(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    if (!this.actions) return this.json(res, 503, { ok: false, error: 'actions not wired' });
+    try {
+      const body = await this.readJson(req);
+      const name = String(body['name'] ?? '').trim();
+      if (!name) return this.json(res, 400, { ok: false, error: 'name required' });
+      const r = this.actions.unshare(name);
+      this.json(res, r.ok ? 200 : 400, r);
     } catch (err) {
       this.json(res, 400, { ok: false, error: (err as Error).message });
     }
@@ -320,13 +363,26 @@ const PAGE_HTML = `<!doctype html>
       <span class="close" onclick="window.__hidePanel()">×</span>
       <h2 id="p-title">—</h2>
       <div class="meta" id="p-meta"></div>
-      <div class="actions">
+      <div class="actions" id="actions-remote">
         <button class="primary" onclick="window.__loadCatalog()">📂 ver catálogo</button>
         <button onclick="window.__doHighlight()">★ highlight</button>
       </div>
-      <div class="section" id="catalog-section">
+      <div class="actions" id="actions-me" style="display:none">
+        <button class="primary" onclick="window.__refreshMyFiles()">🔄 refrescar mis archivos</button>
+      </div>
+      <div class="section" id="section-catalog">
         <h3>catálogo remoto</h3>
         <div id="catalog">(haz click en "ver catálogo")</div>
+      </div>
+      <div class="section" id="section-me" style="display:none">
+        <h3>compartir archivo nuevo</h3>
+        <div style="display:flex; gap:6px; margin-bottom:6px">
+          <input id="share-path" placeholder="ruta absoluta — p.ej. C:\\Users\\…\\foto.jpg" style="flex:1; background:#0f1117; color:#e6e6e6; border:1px solid #2d343f; border-radius:4px; padding:6px; font-family:ui-monospace, monospace; font-size:11px" />
+          <button class="primary" onclick="window.__share()">＋ compartir</button>
+        </div>
+        <div style="font-size:11px; color:#6b7280; margin-bottom:14px">tip: arrastra un archivo desde el explorador a la ventana para auto-rellenar la ruta (Chrome/Edge)</div>
+        <h3>tus archivos compartidos</h3>
+        <div id="my-files">—</div>
       </div>
       <div class="section">
         <h3>descargas activas</h3>
@@ -360,6 +416,12 @@ const PAGE_HTML = `<!doctype html>
   const catalogEl    = document.getElementById('catalog');
   const downloadsEl  = document.getElementById('downloads');
   const toastContainer = document.getElementById('toast-container');
+  const myFilesEl    = document.getElementById('my-files');
+  const sharePathEl  = document.getElementById('share-path');
+  const sectionMe    = document.getElementById('section-me');
+  const sectionCat   = document.getElementById('section-catalog');
+  const actionsRemote = document.getElementById('actions-remote');
+  const actionsMe    = document.getElementById('actions-me');
 
   const originalAttrs = new Map();
   let selectedPeer = null;
@@ -415,6 +477,22 @@ const PAGE_HTML = `<!doctype html>
     }).join('');
   }
 
+  function renderMyFiles(files) {
+    if (!files || files.length === 0) {
+      myFilesEl.innerHTML = '<div style="color:#6b7280;font-size:12px">(catálogo vacío — comparte algo arriba)</div>';
+      return;
+    }
+    myFilesEl.innerHTML = files.map(f => (
+      '<div class="file">' +
+        '<div class="name">' + escapeHtml(f.name) + '</div>' +
+        '<div class="det"><code>' + f.fileId.slice(0, 12) + '…</code> · ' + window.__fmtSize(f.size) + ' · ' + f.numPieces + ' piezas</div>' +
+        '<div class="row">' +
+          '<button class="danger" onclick="window.__unshare(\\'' + escapeHtml(f.name).replace(/'/g, "\\\\'") + '\\')">✕ quitar</button>' +
+        '</div>' +
+      '</div>'
+    )).join('');
+  }
+
   async function refreshPanel(peerId) {
     selectedPeer = peerId;
     panelEl.classList.remove('hidden');
@@ -428,6 +506,20 @@ const PAGE_HTML = `<!doctype html>
         '<div class="kv"><span>conectado</span><span>' + (info.isConnected ? 'sí' : 'no') + '</span></div>' +
         '<div class="kv"><span>tú</span><span>' + (info.isMe ? 'sí' : 'no') + '</span></div>' +
         '<div class="kv"><span>archivos conocidos</span><span>' + info.sharedFiles + '</span></div>';
+
+      // Cambia layout según si el nodo seleccionado eres tú o un remoto.
+      if (info.isMe) {
+        sectionMe.style.display = '';
+        sectionCat.style.display = 'none';
+        actionsRemote.style.display = 'none';
+        actionsMe.style.display = '';
+        window.__refreshMyFiles();
+      } else {
+        sectionMe.style.display = 'none';
+        sectionCat.style.display = '';
+        actionsRemote.style.display = '';
+        actionsMe.style.display = 'none';
+      }
       renderDownloads(info.downloads);
     } catch (err) {
       pMeta.textContent = 'error: ' + err.message;
@@ -473,6 +565,44 @@ const PAGE_HTML = `<!doctype html>
     const r = await api('/api/download', { fileId });
     if (r.ok) showToast('descargando ' + name + '…');
   };
+
+  window.__refreshMyFiles = async () => {
+    const j = await api('/api/my-files');
+    if (j.ok) renderMyFiles(j.files);
+  };
+
+  window.__share = async () => {
+    const p = sharePathEl.value.trim();
+    if (!p) { showToast('pega una ruta primero'); return; }
+    const j = await api('/api/share', { path: p });
+    if (j.ok) {
+      sharePathEl.value = '';
+      showToast('compartido: ' + (j.file ? j.file.name : p));
+      window.__refreshMyFiles();
+    }
+  };
+
+  window.__unshare = async (name) => {
+    if (!confirm('quitar "' + name + '" del catálogo?')) return;
+    const j = await api('/api/unshare', { name });
+    if (j.ok) { showToast('quitado: ' + name); window.__refreshMyFiles(); }
+  };
+
+  // Drag-drop: arrastrar archivos del explorador a la ventana auto-rellena
+  // el campo de ruta. Solo Chrome/Edge exponen "path" en File (legacy).
+  // En navegadores sin esa propiedad, mostramos toast pidiendo pegado manual.
+  window.addEventListener('dragover', (e) => { e.preventDefault(); });
+  window.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!file) return;
+    if (file.path) {
+      sharePathEl.value = file.path;
+      sharePathEl.focus();
+    } else {
+      showToast('tu navegador no expone la ruta — pégala manualmente');
+    }
+  });
 
   window.__doHighlight = async () => {
     if (!selectedPeer) return;
