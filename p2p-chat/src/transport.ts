@@ -40,10 +40,19 @@ interface Conn {
   outgoing: boolean;
 }
 
+export interface UnreachableInfo {
+  peerId: string;
+  host: string;
+  port: number;
+  code: string;
+  message: string;
+}
+
 export declare interface Transport {
   on(event: 'message', listener: (peerId: string, msg: Message) => void): this;
   on(event: 'peer-connected', listener: (peerId: string) => void): this;
   on(event: 'peer-disconnected', listener: (peerId: string) => void): this;
+  on(event: 'peer-unreachable', listener: (info: UnreachableInfo) => void): this;
 }
 
 export class Transport extends EventEmitter {
@@ -94,7 +103,22 @@ export class Transport extends EventEmitter {
     if (peerId === this.opts.peerId) return;
     log.debug(`conectando a ${shortId(peerId)} @ ${host}:${port}`);
     const socket = net.connect({ host, port });
-    socket.once('error', (err) => log.warn(`conexión a ${shortId(peerId)} falló: ${err.message}`));
+    socket.once('error', (err) => {
+      const code = (err as NodeJS.ErrnoException).code ?? '';
+      log.warn(`conexión a ${shortId(peerId)} falló: ${err.message}`);
+      // ETIMEDOUT/ECONNREFUSED/EHOSTUNREACH → puerto inalcanzable. Casi
+      // siempre firewall (Windows bloquea inbound TCP por defecto) o el
+      // peer no está escuchando. Emitimos evento para que main pregunte.
+      if (code === 'ETIMEDOUT' || code === 'ECONNREFUSED' || code === 'EHOSTUNREACH') {
+        this.emit('peer-unreachable', {
+          peerId,
+          host,
+          port,
+          code,
+          message: err.message,
+        });
+      }
+    });
     this.attach(socket, true, peerId);
   }
 

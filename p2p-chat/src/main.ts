@@ -112,6 +112,28 @@ async function bootstrap(): Promise<void> {
     }
   });
 
+  // Peer descubierto por UDP pero TCP no responde → casi seguro firewall.
+  // Avisamos una sola vez por peer hasta que se conecte o expire en discovery,
+  // para no inundar la consola en cada reintento del backoff.
+  const unreachableShown = new Set<string>();
+  transport.on('peer-connected', (pid) => unreachableShown.delete(pid));
+  discovery.on('peer-down', (p) => unreachableShown.delete(p.peerId));
+  transport.on('peer-unreachable', (info) => {
+    if (unreachableShown.has(info.peerId)) return;
+    unreachableShown.add(info.peerId);
+    const sid = shortId(info.peerId);
+    cliSinks.info?.(
+      `\x1b[33m⚠ no se puede conectar a ${sid} @ ${info.host}:${info.port} (${info.code})\x1b[0m`,
+    );
+    cliSinks.info?.('   probable causa: firewall bloqueando TCP entrante en el peer remoto.');
+    cliSinks.info?.('   en el host remoto, abre una PowerShell como administrador y ejecuta:');
+    cliSinks.info?.(
+      `   \x1b[36mNew-NetFirewallRule -DisplayName "p2p-chat" -Direction Inbound -Protocol TCP -LocalPort ${info.port} -Action Allow\x1b[0m`,
+    );
+    cliSinks.info?.('   verifica conectividad con:');
+    cliSinks.info?.(`   \x1b[36mTest-NetConnection ${info.host} -Port ${info.port}\x1b[0m`);
+  });
+
   function handleMessage(from: string, msg: Message): void {
     switch (msg.type) {
       case MSG.BYE:
