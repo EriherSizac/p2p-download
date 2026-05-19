@@ -229,7 +229,9 @@ export class Call extends EventEmitter {
     this.pc.addTransceiver(this.localTrack, { direction: 'sendrecv' });
 
     this.sender = new AudioSender();
-    await this.sender.start(this.opts.source ?? 'tone', (rtp) => {
+    // Default mic — más útil que `tone` para llamadas reales. `tone` queda
+    // disponible si lo pasas explícitamente como source (testing/clase).
+    await this.sender.start(this.opts.source ?? 'mic', (rtp) => {
       try {
         this.localTrack?.writeRtp(rtp);
       } catch (err) {

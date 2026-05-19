@@ -291,7 +291,7 @@ async function bootstrap(): Promise<void> {
         if (callsByPeer.has(to)) return { ok: false, error: `ya hay llamada con ${shortId(to)}` };
         if (!transport.isConnected(to)) return { ok: false, error: 'sin conexión TCP a ese peer' };
         const callId = newCallId();
-        const call = spawnCall({ remotePeerId: to, callId, role: 'caller', source: source ?? 'tone' });
+        const call = spawnCall({ remotePeerId: to, callId, role: 'caller', source: source ?? 'mic' });
         await call.start();
         return { ok: true };
       },
@@ -808,8 +808,8 @@ function setupCli(ctx: CliCtx): void {
 
           case 'call': {
             const prefix = rest[0];
-            const source = rest[1] ?? 'tone';
-            if (!prefix) { out('uso: call <peerId> [tone|mic|mic:<spec>|file:<ruta>]'); break; }
+            const source = rest[1] ?? 'mic';
+            if (!prefix) { out('uso: call <peerId> [mic|tone|mic:<spec>|file:<ruta>]  (default: mic)'); break; }
             const target = resolvePeer(prefix);
             if (!target) { out(`peerId ambiguo o desconocido: ${prefix}`); break; }
             if (!ctx.transport.isConnected(target)) { out(`no hay conexión activa con ${shortId(target)}`); break; }
@@ -825,7 +825,7 @@ function setupCli(ctx: CliCtx): void {
             const offer = ctx.pending.incomingOffer;
             if (!offer) { out('no hay llamadas entrantes pendientes'); break; }
             if (ctx.state.callsByPeer.has(offer.from)) { out(`ya hay una llamada con ${shortId(offer.from)}`); break; }
-            const source = rest[0] ?? 'tone';
+            const source = rest[0] ?? 'mic';
             const call = ctx.spawnCall({ remotePeerId: offer.from, callId: offer.callId, role: 'callee', source });
             ctx.pending.clear();
             await call.accept(offer.sdp);
