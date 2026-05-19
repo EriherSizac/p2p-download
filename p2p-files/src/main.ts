@@ -24,6 +24,8 @@ import { createLogger } from './logger.js';
 import { FileIndex } from './index-files.js';
 import { Scheduler } from './scheduler.js';
 import { isSupported as fwSupported, ruleExistsForPort, requestFirewallRule } from './firewall.js';
+import { GraphServer, type GraphActions, type GraphSnapshot, type RemoteFileSummary } from './graph-server.js';
+import { spawn as spawnChild } from 'node:child_process';
 
 const log = createLogger('main');
 
@@ -126,6 +128,154 @@ async function bootstrap(): Promise<void> {
   const pendingList = new Map<string, PendingResolver<FileSummary[]>>();
   const pendingManifest = new Map<string, PendingResolver<FileManifest>>();
 
+  // ─── Topología (gossip PEER_LIST) ────────────────────────────────────
+  const peerLists = new Map<string, { peers: string[]; ts: number }>();
+
+  /** Lista de conectados que enviamos a un peer en cada gossip. */
+  const sendPeerList = (to: string): void => {
+    transport.send(to, { type: MSG.PEER_LIST, peers: transport.connectedPeers() });
+  };
+
+  // ─── Live graph server (lazy) ────────────────────────────────────────
+  let graphServer: GraphServer | undefined;
+
+  /** Construye un snapshot vis-network del grafo actual. */
+  const buildSnapshot = (): GraphSnapshot => {
+    const me = peerId;
+    const adj = new Map<string, Set<string>>();
+    adj.set(me, new Set(transport.connectedPeers()));
+    for (const [pid, info] of peerLists) adj.set(pid, new Set(info.peers));
+
+    const nodeSet = new Set<string>(adj.keys());
+    for (const targets of adj.values()) for (const t of targets) nodeSet.add(t);
+
+    const visNodes = [...nodeSet].map((pid) => {
+      const files = remoteCatalog.get(pid)?.length ?? 0;
+      const tip = pid + (files > 0 ? `\nshares ${files} archivo(s)` : '');
+      return {
+        id: pid,
+        label: shortId(pid) + (pid === me ? '\n(tú)' : files > 0 ? `\n📂 ${files}` : ''),
+        color: pid === me
+          ? { background: '#2ecc71', border: '#27ae60' }
+          : { background: '#3498db', border: '#2980b9' },
+        size: pid === me ? 28 : 22,
+        title: tip,
+      };
+    });
+
+    const edgeMap = new Map<string, { a: string; b: string; mutual: boolean }>();
+    for (const [a, targets] of adj) {
+      for (const b of targets) {
+        const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+        const existing = edgeMap.get(key);
+        if (existing) existing.mutual = true;
+        else edgeMap.set(key, { a, b, mutual: adj.get(b)?.has(a) ?? false });
+      }
+    }
+    const visEdges = [...edgeMap.entries()].map(([id, e]) => ({
+      id, from: e.a, to: e.b,
+      dashes: !e.mutual,
+      color: { color: e.mutual ? '#27ae60' : '#7f8c8d' },
+      width: e.mutual ? 2 : 1,
+    }));
+
+    const mutuals = [...edgeMap.values()].filter((e) => e.mutual).length;
+    const total = nodeSet.size;
+    const maxEdges = (total * (total - 1)) / 2;
+    return {
+      nodes: visNodes,
+      edges: visEdges,
+      stats: {
+        total, mutuals,
+        oneway: edgeMap.size - mutuals,
+        density: maxEdges > 0 ? (mutuals / maxEdges).toFixed(2) : '0.00',
+      },
+      ts: Date.now(),
+    };
+  };
+
+  /** Empuja snapshot si server activo con clientes — barato, idempotente. */
+  const pushSnapshot = (): void => {
+    if (!graphServer || !graphServer.hasClients()) return;
+    graphServer.emit(buildSnapshot());
+  };
+
+  /** Construye GraphActions con acceso al estado del proceso. */
+  function buildGraphActions(): GraphActions {
+    return {
+      async listRemote(peerId: string): Promise<RemoteFileSummary[]> {
+        // Si tenemos cache reciente, lo devolvemos sin pegarle al peer.
+        const cached = remoteCatalog.get(peerId);
+        const files = cached ?? await requestList(peerId);
+        return files.map((f) => ({
+          fileId: f.fileId,
+          name: f.name,
+          size: f.size,
+          numPieces: f.numPieces,
+        }));
+      },
+      async download(fileId: string) {
+        // Buscar el manifest en algún peer que lo tenga.
+        let manifest: FileManifest | undefined;
+        for (const [pid, files] of remoteCatalog) {
+          if (files.some((f) => f.fileId === fileId)) {
+            try {
+              manifest = await requestManifest(pid, fileId);
+              break;
+            } catch { /* probar siguiente seeder */ }
+          }
+        }
+        if (!manifest) return { ok: false, error: 'no se encontró manifest en ningún peer' };
+        scheduler
+          .startDownload(manifest)
+          .then(() => {
+            graphServer?.toast(`✔ descargado: ${manifest!.name}`);
+            pushSnapshot();
+          })
+          .catch((err) => {
+            graphServer?.toast(`✘ ${manifest!.name}: ${(err as Error).message}`);
+          });
+        return { ok: true };
+      },
+      peerInfo(peerId: string) {
+        const sharedFiles = remoteCatalog.get(peerId)?.length ?? 0;
+        // Downloads activas globales — no podemos filtrar por peer porque
+        // el scheduler no expone esa relación. Mostramos todo.
+        const downloads = scheduler.status().map((d) => ({
+          fileId: '',
+          name: d.name,
+          totalPieces: d.total,
+          havePieces: d.have,
+          ratio: d.total > 0 ? d.have / d.total : 0,
+        }));
+        return {
+          peerId,
+          isMe: peerId === ctx_peerId(),
+          isConnected: transport.isConnected(peerId),
+          sharedFiles,
+          downloads,
+        };
+      },
+    };
+  }
+  const ctx_peerId = (): string => peerId;
+
+  /** Lanza server (lazy) + abre navegador. Re-emite snapshot inicial. */
+  const openLiveGraph = async (): Promise<string> => {
+    if (!graphServer) {
+      graphServer = new GraphServer();
+      await graphServer.start();
+      graphServer.setActions(buildGraphActions());
+    }
+    graphServer.emit(buildSnapshot());
+    openInBrowser(graphServer.url());
+    return graphServer.url();
+  };
+
+  // PEER_LIST inicial al conectar + cambios → snapshot.
+  transport.on('peer-connected', (pid) => { sendPeerList(pid); pushSnapshot(); });
+  transport.on('peer-disconnected', (pid) => { peerLists.delete(pid); pushSnapshot(); });
+
   discovery.on('peer-up', (p) => {
     if (peerId < p.peerId) {
       transport.connect(p.peerId, p.host, p.port);
@@ -161,6 +311,16 @@ async function bootstrap(): Promise<void> {
           pendingList.delete(from);
           p.resolve(msg.files);
         }
+        // Llegó catálogo nuevo → highlight + snapshot (etiqueta de nodo
+        // cambia con el número de archivos compartidos).
+        graphServer?.highlight(from, { color: '#3498db', label: '📂 catálogo' });
+        pushSnapshot();
+        break;
+      }
+      case MSG.PEER_LIST: {
+        // Gossip topológico — no reenviar (un hop).
+        peerLists.set(from, { peers: msg.peers, ts: Date.now() });
+        pushSnapshot();
         break;
       }
       case MSG.MANIFEST: {
@@ -229,6 +389,14 @@ async function bootstrap(): Promise<void> {
     });
   }
 
+  // Gossip periódico de PEER_LIST. 15s = balance entre frescura del grafo
+  // web y tráfico de fondo. Es independiente de eventos peer-connected
+  // (que mandan PEER_LIST inmediato) — sirve para mantener sincronizados
+  // peers que llevan rato conectados pero cuyos vecinos cambiaron.
+  const peerListTimer = setInterval(() => {
+    for (const pid of transport.connectedPeers()) sendPeerList(pid);
+  }, 15_000);
+
   setupCli({
     discovery,
     transport,
@@ -237,10 +405,14 @@ async function bootstrap(): Promise<void> {
     remoteCatalog,
     requestList,
     requestManifest,
+    openLiveGraph,
+    graphHighlight: (pid, opts) => graphServer?.highlight(pid, opts),
   });
 
   const shutdown = (): void => {
     log.info('cerrando…');
+    clearInterval(peerListTimer);
+    graphServer?.stop();
     transport.broadcast({ type: MSG.BYE });
     scheduler.stop();
     discovery.stop();
@@ -259,6 +431,27 @@ interface CliCtx {
   remoteCatalog: Map<string, FileSummary[]>;
   requestList: (peerId: string) => Promise<FileSummary[]>;
   requestManifest: (peerId: string, fileId: string) => Promise<FileManifest>;
+  openLiveGraph: () => Promise<string>;
+  graphHighlight?: (peerId: string, opts?: { color?: string; label?: string }) => void;
+}
+
+/**
+ * Abre URL/fichero en el navegador del sistema. Mismo helper que en p2p-chat
+ * porque ambos proyectos lo necesitan y queremos mantener cada uno independiente.
+ *   - Windows: `cmd /c start "" <url>` (el "" es título obligatorio)
+ *   - macOS:   `open <url>`
+ *   - Linux:   `xdg-open <url>`
+ */
+function openInBrowser(target: string): void {
+  const spawnDetached = (cmd: string, args: string[]): void => {
+    try {
+      const child = spawnChild(cmd, args, { detached: true, stdio: 'ignore' });
+      child.unref();
+    } catch { /* no-op */ }
+  };
+  if (process.platform === 'win32') spawnDetached('cmd', ['/c', 'start', '""', target]);
+  else if (process.platform === 'darwin') spawnDetached('open', [target]);
+  else spawnDetached('xdg-open', [target]);
 }
 
 function setupCli(ctx: CliCtx): void {
@@ -279,6 +472,9 @@ function setupCli(ctx: CliCtx): void {
     out('  │  search [nombre]       busca en peers conectados     │');
     out('  │  get <peerId> <name>   descarga un archivo           │');
     out('  │  peers | status        info del enjambre             │');
+    out('  │  graph [open]          grafo ASCII | live HTML+SSE   │');
+    out('  │  ping <peerId>         pulso visual en grafo web     │');
+    out('  │  highlight <p> [color] marca visual en grafo web     │');
     out('  │  menu | help | quit                                  │');
     out('  └──────────────────────────────────────────────────────┘');
   };
@@ -341,6 +537,42 @@ function setupCli(ctx: CliCtx): void {
             .catch((err) => out(`✘ falló descarga: ${err.message}`));
           break;
         }
+        case 'graph': {
+          // `graph open` arranca el server web con grafo + catálogo en vivo.
+          // Sin args, mensaje breve apuntando a la versión interactiva (en
+          // este proyecto no hay render ASCII separado — el HTML hace todo).
+          const sub = rest[0];
+          if (sub === 'open' || sub === 'live' || sub === 'html') {
+            const url = await ctx.openLiveGraph();
+            out(`📊 grafo en vivo: ${url}`);
+            out('   click en un nodo para ver su catálogo y descargar archivos');
+          } else {
+            out('uso: graph open  (abre HTML interactivo con SSE)');
+          }
+          break;
+        }
+
+        case 'ping': {
+          const prefix = rest[0];
+          if (!prefix) { out('uso: ping <peerId>'); break; }
+          const target = resolvePeer(prefix);
+          if (!target) { out('peer no resuelto'); break; }
+          ctx.graphHighlight?.(target, { color: '#f1c40f', label: '⚡ ping' });
+          out(`⚡ ping → ${shortId(target)} (mira el grafo web)`);
+          break;
+        }
+
+        case 'highlight': {
+          const prefix = rest[0];
+          if (!prefix) { out('uso: highlight <peerId> [color]'); break; }
+          const target = resolvePeer(prefix);
+          if (!target) { out('peer no resuelto'); break; }
+          const color = rest[1] ?? '#9b59b6';
+          ctx.graphHighlight?.(target, { color, label: '★ highlight' });
+          out(`★ highlight → ${shortId(target)}`);
+          break;
+        }
+
         case 'status': {
           const ds = ctx.scheduler.status();
           if (ds.length === 0) { out('(sin descargas activas)'); }
@@ -427,7 +659,7 @@ function setupCli(ctx: CliCtx): void {
           process.kill(process.pid, 'SIGINT');
           return;
         case 'help':
-          out('comandos: peers | list <peerId> | get <peerId> <name> | status | share [ruta] | unshare <name> | search [nombre] | menu | quit');
+          out('comandos: peers | list <peerId> | get <peerId> <name> | status | share [ruta] | unshare <name> | search [nombre] | graph [open] | ping <peerId> | highlight <peerId> [color] | menu | quit');
           break;
         default:
           out(`comando desconocido: ${cmd}`);

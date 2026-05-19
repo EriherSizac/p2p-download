@@ -31,6 +31,9 @@ export const MSG = {
   PIECE: 0x08,
   ERROR: 0x09,
   BYE: 0x0a,
+  /** Gossip topológico. El emisor lista sus peerIds conectados; el
+   *  receptor lo usa para construir el grafo global de la red. */
+  PEER_LIST: 0x0b,
 } as const;
 
 export type MsgType = (typeof MSG)[keyof typeof MSG];
@@ -64,7 +67,8 @@ export type Message =
   | { type: typeof MSG.REQUEST; fileId: string; pieceIndex: number }
   | { type: typeof MSG.PIECE; fileId: string; pieceIndex: number; data: Buffer }
   | { type: typeof MSG.ERROR; code: string; message: string }
-  | { type: typeof MSG.BYE };
+  | { type: typeof MSG.BYE }
+  | { type: typeof MSG.PEER_LIST; peers: string[] };
 
 export const PROTOCOL_VERSION = 1;
 
@@ -123,7 +127,8 @@ export function decode(buf: Buffer): Message {
     case MSG.MANIFEST_REPLY:
     case MSG.HAVE:
     case MSG.REQUEST:
-    case MSG.ERROR: {
+    case MSG.ERROR:
+    case MSG.PEER_LIST: {
       const obj = JSON.parse(body.toString('utf8')) as Record<string, unknown>;
       return { type, ...obj } as Message;
     }
