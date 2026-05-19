@@ -19,9 +19,6 @@
  */
 
 import readline from 'node:readline';
-import path from 'node:path';
-import { tmpdir } from 'node:os';
-import { writeFileSync as fsWriteFileSync } from 'node:fs';
 import { spawn as spawnChild } from 'node:child_process';
 import { Discovery } from './discovery.js';
 import { Transport } from './transport.js';
@@ -37,6 +34,7 @@ import { createLogger } from './logger.js';
 import { append as histAppend, tail as histTail, filePath as histPath } from './history.js';
 import { Call } from './call.js';
 import { isSupported as fwSupported, ruleExistsForPort, udpRuleExists, requestFirewallRule } from './firewall.js';
+import { GraphServer, type GraphSnapshot } from './graph-server.js';
 
 const log = createLogger('main');
 
@@ -158,6 +156,96 @@ async function bootstrap(): Promise<void> {
   transport.on('peer-connected', (pid) => sendPeerList(pid));
 
   transport.on('peer-disconnected', (pid) => peerLists.delete(pid));
+
+  // ─── Server HTTP del grafo en vivo ──────────────────────────────────
+  // Se crea perezosamente cuando el usuario ejecuta `graph open` por
+  // primera vez. Mantenemos la referencia aquí para suscribirle eventos
+  // de transporte/gossip y empujar snapshots al navegador.
+  let graphServer: GraphServer | undefined;
+
+  /** Construye el snapshot actual del grafo en formato vis-network. */
+  const buildSnapshot = (): GraphSnapshot => {
+    const me = peerId;
+    const adj = new Map<string, Set<string>>();
+    adj.set(me, new Set(transport.connectedPeers()));
+    for (const [pid, info] of peerLists) adj.set(pid, new Set(info.peers));
+
+    const nodeSet = new Set<string>(adj.keys());
+    for (const targets of adj.values()) for (const t of targets) nodeSet.add(t);
+
+    const visNodes = [...nodeSet].map((pid) => {
+      const liv = liveness.get(pid);
+      const rttTip = liv?.rttMs !== undefined ? `\nRTT ≈ ${liv.rttMs.toFixed(0)} ms` : '';
+      return {
+        id: pid,
+        label: shortId(pid) + (pid === me ? '\n(tú)' : ''),
+        color: pid === me
+          ? { background: '#2ecc71', border: '#27ae60' }
+          : { background: '#3498db', border: '#2980b9' },
+        size: pid === me ? 28 : 22,
+        title: pid + rttTip,
+      };
+    });
+
+    const edgeMap = new Map<string, { a: string; b: string; mutual: boolean }>();
+    for (const [a, targets] of adj) {
+      for (const b of targets) {
+        const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+        const existing = edgeMap.get(key);
+        if (existing) existing.mutual = true; // ya vimos b→a antes, ahora a→b
+        else edgeMap.set(key, { a, b, mutual: adj.get(b)?.has(a) ?? false });
+      }
+    }
+    const visEdges = [...edgeMap.entries()].map(([id, e]) => ({
+      id,
+      from: e.a,
+      to: e.b,
+      dashes: !e.mutual,
+      color: { color: e.mutual ? '#27ae60' : '#7f8c8d' },
+      width: e.mutual ? 2 : 1,
+    }));
+
+    const mutuals = [...edgeMap.values()].filter((e) => e.mutual).length;
+    const total = nodeSet.size;
+    const maxEdges = (total * (total - 1)) / 2;
+    return {
+      nodes: visNodes,
+      edges: visEdges,
+      stats: {
+        total,
+        mutuals,
+        oneway: edgeMap.size - mutuals,
+        density: maxEdges > 0 ? (mutuals / maxEdges).toFixed(2) : '0.00',
+      },
+      ts: Date.now(),
+    };
+  };
+
+  /** Empuja snapshot si hay server activo con clientes — barato y seguro. */
+  const pushSnapshot = (): void => {
+    if (!graphServer || !graphServer.hasClients()) return;
+    graphServer.emit(buildSnapshot());
+  };
+
+  // Cualquier cambio observable en la topología → empujar snapshot.
+  transport.on('peer-connected', pushSnapshot);
+  transport.on('peer-disconnected', pushSnapshot);
+
+  /**
+   * Arranca (si no está corriendo) el server HTTP del grafo en vivo, manda
+   * un snapshot inicial y abre el navegador. Llamadas siguientes solo
+   * reabren la página (el server sigue corriendo y suscrito a eventos).
+   */
+  const openLiveGraph = async (): Promise<string> => {
+    if (!graphServer) {
+      graphServer = new GraphServer();
+      await graphServer.start();
+    }
+    // Snapshot inicial: el server lo entrega a clientes que se conecten.
+    graphServer.emit(buildSnapshot());
+    openInBrowser(graphServer.url());
+    return graphServer.url();
+  };
 
   // ---------------------------------------------------------------------
   // Manejo de mensajes entrantes.
@@ -285,6 +373,7 @@ async function bootstrap(): Promise<void> {
         // estado actual. No reenviamos (un solo hop) — el destinatario debe
         // pedir su propio gossip a sus vecinos para componer la vista completa.
         peerLists.set(from, { peers: msg.peers, ts: Date.now() });
+        pushSnapshot();
         break;
       }
 
@@ -424,6 +513,7 @@ async function bootstrap(): Promise<void> {
     peerId,
     sinks: cliSinks,
     state: { pendingAcks, liveness, calls, callsByPeer, peerLists },
+    openLiveGraph,
     pending: {
       get incomingOffer() { return pendingIncomingOffer; },
       clear() { pendingIncomingOffer = undefined; },
@@ -435,6 +525,7 @@ async function bootstrap(): Promise<void> {
     log.info('cerrando…');
     clearInterval(pingTimer);
     clearInterval(peerListTimer);
+    graphServer?.stop();
     for (const call of calls.values()) void call.closeFromRemote('shutdown');
     transport.broadcast({ type: MSG.BYE });
     discovery.stop();
@@ -466,6 +557,7 @@ interface CliCtx {
     clear(): void;
   };
   spawnCall(opts: { remotePeerId: string; callId: string; role: 'caller' | 'callee'; source?: string }): Call;
+  openLiveGraph(): Promise<string>;
 }
 
 function setupCli(ctx: CliCtx): void {
@@ -491,7 +583,7 @@ function setupCli(ctx: CliCtx): void {
     out('  │  history [n]              últimos n mensajes (default 20)│');
     out('  │  peers                    peers descubiertos + RTT       │');
     out('  │  who                      peers conectados + RTT         │');
-    out('  │  graph [open]             grafo de peers (ASCII | HTML)  │');
+    out('  │  graph [open]             grafo ASCII | live HTML+SSE    │');
     out('  │  call <peerId> [source]   llamar (source=tone|mic|file:…)│');
     out('  │  answer                   aceptar llamada entrante       │');
     out('  │  hangup                   colgar llamada activa          │');
@@ -654,11 +746,17 @@ function setupCli(ctx: CliCtx): void {
           }
 
           case 'graph': {
-            // `graph`          → ASCII bonito en la terminal
-            // `graph open|html`→ HTML interactivo en el navegador
+            // `graph`           → ASCII bonito en la terminal
+            // `graph open|live` → HTML interactivo en el navegador con
+            //                     actualizaciones en vivo vía SSE
             const sub = rest[0];
-            if (sub === 'open' || sub === 'html') renderGraphHtml(out, ctx);
-            else renderGraph(out, ctx);
+            if (sub === 'open' || sub === 'live' || sub === 'html') {
+              const url = await ctx.openLiveGraph();
+              out(`📊 grafo en vivo: ${url}`);
+              out('   se actualiza automáticamente cuando entran/salen peers');
+            } else {
+              renderGraph(out, ctx);
+            }
             break;
           }
 
@@ -842,103 +940,7 @@ function renderGraph(out: (s: string) => void, ctx: CliCtx): void {
 }
 
 /**
- * Genera un HTML autocontenido con vis-network (CDN) que dibuja el grafo
- * de forma interactiva (arrastrar nodos, zoom, etc). Lo guarda en tmpdir
- * y lo abre con el comando estándar de la plataforma.
- */
-function renderGraphHtml(out: (s: string) => void, ctx: CliCtx): void {
-  const { nodes, edges, adj } = buildGraph(ctx);
-  if (nodes.length === 0) { out('(sin peers conocidos)'); return; }
-  const me = ctx.peerId;
-
-  const visNodes = nodes.map((pid) => ({
-    id: pid,
-    label: shortId(pid) + (pid === me ? '\n(tú)' : ''),
-    color: pid === me
-      ? { background: '#2ecc71', border: '#27ae60' }
-      : { background: '#3498db', border: '#2980b9' },
-    size: pid === me ? 28 : 22,
-    font: { color: '#ffffff', size: 14, face: 'monospace' },
-    title: pid + (ctx.state.liveness.get(pid)?.rttMs !== undefined
-      ? `\nRTT ≈ ${ctx.state.liveness.get(pid)!.rttMs!.toFixed(0)}ms`
-      : ''),
-  }));
-
-  const visEdges = edges.map((e) => ({
-    from: e.a,
-    to: e.b,
-    dashes: !e.mutual,
-    color: { color: e.mutual ? '#27ae60' : '#7f8c8d' },
-    width: e.mutual ? 2 : 1,
-  }));
-
-  // Estadísticas para mostrar en el header.
-  const mutuals = edges.filter((e) => e.mutual).length;
-  const oneway = edges.length - mutuals;
-  const density = nodes.length > 1
-    ? (mutuals / ((nodes.length * (nodes.length - 1)) / 2)).toFixed(2)
-    : '0.00';
-  void adj;
-
-  const dataPayload = JSON.stringify({ nodes: visNodes, edges: visEdges });
-  const html = `<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8">
-<title>p2p-chat — grafo de peers</title>
-<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
-<style>
-  html, body { margin:0; padding:0; height:100%; background:#0f1117; color:#e6e6e6;
-               font-family: -apple-system, system-ui, "Segoe UI", sans-serif; }
-  #header { padding: 12px 20px; border-bottom: 1px solid #222; display:flex; align-items:center; gap:16px; }
-  #header h1 { margin:0; font-size:16px; font-weight:600; }
-  #header .stats { font-size:12px; color:#8a8f99; }
-  #header .legend { margin-left:auto; font-size:12px; color:#8a8f99; }
-  #header .legend span { margin-right:12px; }
-  #header .swatch { display:inline-block; width:14px; height:2px; vertical-align:middle; margin-right:4px; }
-  #net { width:100%; height: calc(100% - 50px); }
-  .me   { color:#2ecc71; font-weight:bold; }
-  .peer { color:#3498db; }
-  .solid { background:#27ae60; }
-  .dashed { background:#7f8c8d; }
-</style>
-</head>
-<body>
-<div id="header">
-  <h1>Grafo de peers <span class="peer">p2p-chat</span></h1>
-  <div class="stats">nodos=${nodes.length} · mutuas=${mutuals} · un sentido=${oneway} · densidad=${density}</div>
-  <div class="legend">
-    <span><span class="swatch solid"></span>mutua</span>
-    <span><span class="swatch dashed"></span>un sentido</span>
-    <span class="me">● tú</span>
-    <span class="peer">● otros</span>
-  </div>
-</div>
-<div id="net"></div>
-<script>
-  const raw = ${dataPayload};
-  const data = {
-    nodes: new vis.DataSet(raw.nodes),
-    edges: new vis.DataSet(raw.edges),
-  };
-  new vis.Network(document.getElementById('net'), data, {
-    nodes: { shape: 'dot' },
-    edges: { smooth: { type: 'continuous' } },
-    physics: { stabilization: true, barnesHut: { springLength: 180, gravitationalConstant: -3000 } },
-    interaction: { hover: true, dragNodes: true },
-  });
-</script>
-</body>
-</html>`;
-
-  const file = path.join(tmpdir(), `p2p-chat-graph-${Date.now()}.html`);
-  fsWriteFileSync(file, html, 'utf8');
-  out(`  grafo escrito en ${file}`);
-  openInBrowser(file);
-}
-
-/**
- * Abre un fichero local en el navegador por defecto. Cross-platform:
+ * Abre una URL/fichero local en el navegador por defecto. Cross-platform:
  *   - Windows: `cmd /c start "" <file>`  ("" es el título obligatorio
  *              cuando hay un argumento con espacios; sin él, start trata el
  *              primer arg como título y no abre nada).
