@@ -32,6 +32,7 @@ import {
 import { createLogger } from './logger.js';
 import { append as histAppend, tail as histTail, filePath as histPath } from './history.js';
 import { Call } from './call.js';
+import { isSupported as fwSupported, ruleExistsForPort, requestFirewallRule } from './firewall.js';
 
 const log = createLogger('main');
 
@@ -62,12 +63,48 @@ interface PeerLiveness {
   pendingPings: Map<number, number>;
 }
 
+/**
+ * Prompt sí/no en stdin sin readline persistente. Lo usamos antes de
+ * arrancar la CLI principal para no chocar con su propio readline.
+ * Cierra el interface al resolver para liberar stdin.
+ */
+function askYesNo(question: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (ans) => {
+      rl.close();
+      resolve(/^y(es)?$/i.test(ans.trim()));
+    });
+  });
+}
+
 async function bootstrap(): Promise<void> {
   const peerId = generatePeerId();
   log.info(`peerId = ${shortId(peerId)} (full=${peerId})`);
 
   const transport = new Transport({ peerId, tcpPort: TCP_PORT });
   const actualPort = await transport.start();
+
+  // Firewall: si estamos en Windows y no hay regla inbound para nuestro
+  // puerto, ofrecer crearla (UAC) ANTES de empezar a descubrir peers.
+  // Evita que el primer round de conexiones muera por ETIMEDOUT.
+  if (fwSupported()) {
+    const ok = await ruleExistsForPort(actualPort);
+    if (!ok) {
+      const yes = await askYesNo(
+        `firewall: no hay regla inbound TCP para :${actualPort}. ¿Crearla? (pedirá UAC) [y/N] `,
+      );
+      if (yes) {
+        log.info('solicitando elevación…');
+        const created = await requestFirewallRule(actualPort);
+        log.info(created ? `regla creada para :${actualPort}` : 'no se creó la regla (UAC denegado o error)');
+      } else {
+        log.warn('firewall sin abrir; peers remotos quizá no puedan conectar.');
+      }
+    } else {
+      log.debug(`firewall: regla para :${actualPort} ya existe`);
+    }
+  }
 
   const discovery = new Discovery({ peerId, tcpPort: actualPort, discoveryPort: DISCOVERY_PORT });
   await discovery.start();
@@ -412,6 +449,7 @@ function setupCli(ctx: CliCtx): void {
     out('  │  call <peerId> [source]   llamar (source=tone|mic|file:…)│');
     out('  │  answer                   aceptar llamada entrante       │');
     out('  │  hangup                   colgar llamada activa          │');
+    out('  │  firewall                 abrir regla inbound (UAC)      │');
     out('  │  menu | help | quit                                      │');
     out('  └──────────────────────────────────────────────────────────┘');
   };
@@ -569,6 +607,17 @@ function setupCli(ctx: CliCtx): void {
             break;
           }
 
+          case 'firewall': {
+            if (!fwSupported()) { out('firewall: solo Windows'); break; }
+            const port = ctx.transport.port();
+            const exists = await ruleExistsForPort(port);
+            if (exists) { out(`firewall: regla para :${port} ya existe`); break; }
+            out(`firewall: solicitando UAC para abrir :${port}…`);
+            const ok = await requestFirewallRule(port);
+            out(ok ? `firewall: regla creada para :${port}` : 'firewall: no se creó la regla');
+            break;
+          }
+
           case 'hangup': {
             if (ctx.pending.incomingOffer) {
               const o = ctx.pending.incomingOffer;
@@ -593,7 +642,7 @@ function setupCli(ctx: CliCtx): void {
             process.kill(process.pid, 'SIGINT');
             return;
           case 'help':
-            out('comandos: peers | who | chat <texto> | msg <peerId> <texto> | history [n] | call <peerId> [source] | answer | hangup | menu | quit');
+            out('comandos: peers | who | chat <texto> | msg <peerId> <texto> | history [n] | call <peerId> [source] | answer | hangup | firewall | menu | quit');
             break;
           default:
             out(`comando desconocido: ${cmd}`);

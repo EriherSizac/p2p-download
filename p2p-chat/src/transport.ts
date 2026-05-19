@@ -149,6 +149,11 @@ export class Transport extends EventEmitter {
     return this.conns.has(peerId);
   }
 
+  /** Puerto TCP real en el que escuchamos (tras `start()`). */
+  port(): number {
+    return this.actualPort;
+  }
+
   // --- internas ----------------------------------------------------------
 
   private acceptIncoming(socket: net.Socket): void {
