@@ -28,7 +28,7 @@
  */
 
 import dgram from 'node:dgram';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
@@ -78,20 +78,66 @@ function micInputArgs(spec?: string): string[] {
       return ['-f', 'avfoundation', '-i', spec ?? ':0'];
     case 'linux':
       return ['-f', 'pulse', '-i', spec ?? 'default'];
-    case 'win32':
-      // DirectShow no tiene "default". El usuario debe nombrar el dispositivo:
-      //   call <peer> mic:audio=<nombre>
-      // Lista con: ffmpeg -list_devices true -f dshow -i dummy
-      if (!spec) {
-        throw new Error(
-          'En Windows especifica el dispositivo: mic:audio=<nombre>. ' +
-            'Lista con `ffmpeg -list_devices true -f dshow -i dummy`.',
-        );
-      }
-      return ['-f', 'dshow', '-i', spec];
+    case 'win32': {
+      // DirectShow no expone "default". Si el usuario no pasó nombre,
+      // enumeramos dispositivos y usamos el PRIMER audio listado.
+      // Si pasó algo, lo respetamos (puede ser `audio=Nombre exacto`).
+      const finalSpec = spec ?? `audio=${detectDefaultWindowsMic()}`;
+      return ['-f', 'dshow', '-i', finalSpec];
+    }
     default:
       throw new Error(`mic no soportado en plataforma: ${process.platform}`);
   }
+}
+
+/**
+ * Pregunta a ffmpeg por la lista de dispositivos DirectShow y devuelve
+ * el nombre del PRIMER dispositivo de audio. ffmpeg imprime esta info
+ * en stderr (no stdout) — patrón clásico de ffmpeg con `-list_devices`.
+ *
+ * Formato típico de la salida:
+ *
+ *   [dshow @ 0x...]  "Microphone (Realtek Audio)"
+ *   [dshow @ 0x...]     Alternative name "@device_cm_{GUID}\..."
+ *
+ * Vienen ANTES los de vídeo y luego los de audio. Detectamos la sección
+ * "DirectShow audio devices" para no confundir.
+ *
+ * Se llama sincrónicamente (spawnSync) porque ocurre solo al arrancar
+ * captura y es rapidísimo (<100ms). Cachea entre llamadas.
+ */
+let cachedWinMic: string | undefined;
+function detectDefaultWindowsMic(): string {
+  if (cachedWinMic) return cachedWinMic;
+  const result = spawnSync('ffmpeg', ['-hide_banner', '-list_devices', 'true', '-f', 'dshow', '-i', 'dummy'], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  // ffmpeg sale con código != 0 al fallar el `-i dummy`, pero la lista
+  // ya está en stderr. Por eso no chequeamos status.
+  const stderr = result.stderr ?? '';
+  // Estado: false = todavía en sección vídeo, true = ya en audio.
+  let inAudioSection = false;
+  let firstAudio: string | undefined;
+  for (const line of stderr.split(/\r?\n/)) {
+    if (/DirectShow\s+audio\s+devices/i.test(line)) { inAudioSection = true; continue; }
+    if (/DirectShow\s+video\s+devices/i.test(line)) { inAudioSection = false; continue; }
+    if (!inAudioSection) continue;
+    // Líneas con dispositivos llevan el nombre entre comillas dobles.
+    // Saltamos las líneas "Alternative name" (usan el GUID interno).
+    if (/Alternative name/i.test(line)) continue;
+    const m = line.match(/"([^"]+)"/);
+    if (m) { firstAudio = m[1]; break; }
+  }
+  if (!firstAudio) {
+    throw new Error(
+      'No se encontró ningún dispositivo de audio DirectShow. ' +
+        'Conecta un mic o pasa uno explícito: `call <peer> mic:audio=<nombre>`.',
+    );
+  }
+  cachedWinMic = firstAudio;
+  log.info(`mic Windows por defecto: "${firstAudio}"`);
+  return firstAudio;
 }
 
 /**
@@ -163,7 +209,7 @@ export class AudioSender {
       ...inputArgsForSource(source),
       ...outputArgsRtp('127.0.0.1', this.bridgePort),
     ];
-    log.info(`ffmpeg sender: ${args.join(' ')}`);
+    log.debug(`ffmpeg sender: ${args.join(' ')}`);
     this.ffmpeg = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     this.ffmpeg.stderr?.on('data', (b: Buffer) => {
       const s = b.toString('utf8').trim();
@@ -279,15 +325,16 @@ export class AudioReceiver {
     //   -fflags nobuffer / -flags low_delay → minimizan buffer y latencia.
     //   -nodisp                          → audio-only (no ventana SDL).
     //   -autoexit                        → al cortarse el flujo, salir.
-    //   -loglevel info                   → ver init SDL/decoder; si hay
-    //      "no audio device" o similar, sale aquí.
+    //   -loglevel error → solo errores reales. ffplay imprime un status
+    //      por frame ("aq=…KB") en niveles más verbosos; con `error`
+    //      desaparece. Si necesitas diagnóstico, sube a `info` aquí.
     const args = [
       '-protocol_whitelist', 'file,rtp,udp',
       '-fflags', 'nobuffer',
       '-flags', 'low_delay',
       '-nodisp',
       '-autoexit',
-      '-loglevel', 'info',
+      '-loglevel', 'error',
       '-i', this.sdpPath!,
     ];
     // Env override SDL en Windows. Razón: el backend WASAPI de SDL2 a veces
@@ -298,19 +345,19 @@ export class AudioReceiver {
     if (process.platform === 'win32' && !env['SDL_AUDIODRIVER']) {
       env['SDL_AUDIODRIVER'] = 'directsound';
     }
-    log.info(`ffplay receiver: ffplay ${args.join(' ')}`);
-    if (env['SDL_AUDIODRIVER']) log.info(`  SDL_AUDIODRIVER=${env['SDL_AUDIODRIVER']}`);
+    log.debug(`ffplay receiver: ffplay ${args.join(' ')}`);
+    if (env['SDL_AUDIODRIVER']) log.debug(`SDL_AUDIODRIVER=${env['SDL_AUDIODRIVER']}`);
     this.ffplay = spawn('ffplay', args, { stdio: ['ignore', 'ignore', 'pipe'], env });
-    // Subimos ffplay stderr a INFO: si algo va mal (no audio device, codec
-    // raro, etc.) el mensaje sale en consola sin tener que activar debug.
+    // ffplay stderr → debug. Con `-loglevel error` solo sale aquí cuando
+    // hay algo realmente roto, y el nivel debug evita ruido al usuario.
     this.ffplay.stderr?.on('data', (b: Buffer) => {
       const s = b.toString('utf8').trim();
-      if (s) log.info(`[ffplay] ${s}`);
+      if (s) log.debug(`[ffplay] ${s}`);
     });
     this.ffplay.on('error', (err) => {
       log.warn(`ffplay no se pudo lanzar: ${err.message}. Reproducción desactivada.`);
     });
-    this.ffplay.on('exit', (code) => log.info(`[ffplay] exit code=${code}`));
+    this.ffplay.on('exit', (code) => log.debug(`[ffplay] exit code=${code}`));
   }
 }
 
