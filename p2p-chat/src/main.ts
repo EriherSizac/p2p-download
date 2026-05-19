@@ -19,6 +19,10 @@
  */
 
 import readline from 'node:readline';
+import path from 'node:path';
+import { tmpdir } from 'node:os';
+import { writeFileSync as fsWriteFileSync } from 'node:fs';
+import { spawn as spawnChild } from 'node:child_process';
 import { Discovery } from './discovery.js';
 import { Transport } from './transport.js';
 import {
@@ -487,7 +491,7 @@ function setupCli(ctx: CliCtx): void {
     out('  │  history [n]              últimos n mensajes (default 20)│');
     out('  │  peers                    peers descubiertos + RTT       │');
     out('  │  who                      peers conectados + RTT         │');
-    out('  │  graph                    grafo de conectividad de la red│');
+    out('  │  graph [open]             grafo de peers (ASCII | HTML)  │');
     out('  │  call <peerId> [source]   llamar (source=tone|mic|file:…)│');
     out('  │  answer                   aceptar llamada entrante       │');
     out('  │  hangup                   colgar llamada activa          │');
@@ -650,7 +654,11 @@ function setupCli(ctx: CliCtx): void {
           }
 
           case 'graph': {
-            renderGraph(out, ctx);
+            // `graph`          → ASCII bonito en la terminal
+            // `graph open|html`→ HTML interactivo en el navegador
+            const sub = rest[0];
+            if (sub === 'open' || sub === 'html') renderGraphHtml(out, ctx);
+            else renderGraph(out, ctx);
             break;
           }
 
@@ -690,7 +698,7 @@ function setupCli(ctx: CliCtx): void {
             process.kill(process.pid, 'SIGINT');
             return;
           case 'help':
-            out('comandos: peers | who | graph | chat <texto> | msg <peerId> <texto> | history [n] | call <peerId> [source] | answer | hangup | firewall | menu | quit');
+            out('comandos: peers | who | graph [open] | chat <texto> | msg <peerId> <texto> | history [n] | call <peerId> [source] | answer | hangup | firewall | menu | quit');
             break;
           default:
             out(`comando desconocido: ${cmd}`);
@@ -704,80 +712,257 @@ function setupCli(ctx: CliCtx): void {
 }
 
 /**
- * Renderiza el grafo de conectividad de la red en ASCII.
+ * Construye el grafo lógico a partir del estado actual.
  *
  * Datos disponibles:
  *   - Nosotros (`ctx.peerId`) → conocemos a `transport.connectedPeers()`.
- *   - Cada peer `X` conectado nos ha mandado un `PEER_LIST` con SUS vecinos
- *     (almacenado en `ctx.state.peerLists`).
+ *   - Cada peer remoto nos manda PEER_LIST (sus vecinos) → `peerLists`.
  *
- * Construimos la unión: nodos = todos los peerIds que aparecen en cualquier
- * lista + nosotros. Aristas dirigidas A→B significa "A dice conocer a B".
- * Si A→B y B→A existen, la conexión es mutua (más sólida).
- *
- * Render: dos secciones.
- *   1) Adyacencia por peer (lista A → [vecinos]).
- *   2) Resumen de aristas mutuas vs unidireccionales + densidad.
+ * Producimos:
+ *   - `nodes`: todos los peerIds vistos.
+ *   - `edges`: aristas únicas (clave canónica a|b) con flag `mutual`.
  */
-function renderGraph(out: (s: string) => void, ctx: CliCtx): void {
+function buildGraph(ctx: CliCtx): {
+  nodes: string[];
+  edges: Array<{ a: string; b: string; mutual: boolean }>;
+  adj: Map<string, Set<string>>;
+} {
   const me = ctx.peerId;
-  const myNeighbors = new Set(ctx.transport.connectedPeers());
-
-  // Adjacency: peerId → Set de a quién dice conocer.
   const adj = new Map<string, Set<string>>();
-  adj.set(me, new Set(myNeighbors));
+  adj.set(me, new Set(ctx.transport.connectedPeers()));
   for (const [pid, info] of ctx.state.peerLists) {
     adj.set(pid, new Set(info.peers));
   }
+  const nodeSet = new Set<string>(adj.keys());
+  for (const targets of adj.values()) for (const t of targets) nodeSet.add(t);
 
-  // Conjunto total de nodos: todo lo que aparece como origen o destino.
-  const nodes = new Set<string>(adj.keys());
-  for (const targets of adj.values()) for (const t of targets) nodes.add(t);
-
-  if (nodes.size <= 1) { out('(sin peers conocidos)'); return; }
-
-  out('');
-  out('  ┌─ grafo de conectividad ──────────────────────────────────┐');
-
-  // Sección 1: adyacencia. Para cada nodo, su lista de vecinos vistos.
-  // Marcamos con "==" las aristas mutuas y "->" las unidireccionales (gossip
-  // aún no recibido en sentido inverso, o peer no nos ha hablado todavía).
-  const sortedNodes = [...nodes].sort();
-  for (const a of sortedNodes) {
-    const label = shortId(a) + (a === me ? ' (tú)' : '');
-    const targets = [...(adj.get(a) ?? [])].sort();
-    if (targets.length === 0) {
-      out(`  ${label}  →  (sin vecinos conocidos)`);
-      continue;
-    }
-    const parts = targets.map((b) => {
-      const mutual = adj.get(b)?.has(a) ?? false;
-      const arrow = mutual ? '==' : '→';
-      return `${arrow} ${shortId(b)}${b === me ? '(tú)' : ''}`;
-    });
-    out(`  ${label}  ${parts.join('  ')}`);
-  }
-
-  // Sección 2: métricas de red.
-  let mutual = 0;
-  let oneway = 0;
+  const edges: Array<{ a: string; b: string; mutual: boolean }> = [];
   const seen = new Set<string>();
   for (const [a, targets] of adj) {
     for (const b of targets) {
       const key = a < b ? `${a}|${b}` : `${b}|${a}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const reverse = adj.get(b)?.has(a) ?? false;
-      if (reverse) mutual++; else oneway++;
+      const mutual = adj.get(b)?.has(a) ?? false;
+      edges.push({ a, b, mutual });
     }
   }
-  const n = nodes.size;
+  return { nodes: [...nodeSet].sort(), edges, adj };
+}
+
+/**
+ * Render ASCII bonito con colores ANSI:
+ *
+ *   ●  nodo "tú"        (verde)
+ *   ○  otros peers      (cian)
+ *   ━━ arista mutua     (verde claro, sólido)
+ *   ┄┄ arista un sentido (gris, discontinuo)
+ *
+ * Diseño en dos partes:
+ *   1) Diagrama tipo "estrella" centrado en tu peer con sus vecinos
+ *      directos y RTT — la información más práctica para el usuario.
+ *   2) Tabla completa de aristas (origen, destino, tipo).
+ */
+function renderGraph(out: (s: string) => void, ctx: CliCtx): void {
+  const { nodes, edges, adj } = buildGraph(ctx);
+  if (nodes.length <= 1) { out('(sin peers conocidos)'); return; }
+  const me = ctx.peerId;
+
+  const C = {
+    reset: '\x1b[0m',
+    bold: '\x1b[1m',
+    dim: '\x1b[2m',
+    green: '\x1b[32m',
+    cyan: '\x1b[36m',
+    yellow: '\x1b[33m',
+    gray: '\x1b[90m',
+  };
+  const dot = (pid: string): string =>
+    pid === me ? `${C.green}${C.bold}●${C.reset}` : `${C.cyan}○${C.reset}`;
+  const name = (pid: string): string => {
+    const s = shortId(pid);
+    return pid === me ? `${C.green}${C.bold}${s}${C.reset}` : `${C.cyan}${s}${C.reset}`;
+  };
+  const fmtRtt = (pid: string): string => {
+    const liv = ctx.state.liveness.get(pid);
+    if (!liv || liv.rttMs === undefined) return `${C.dim}—${C.reset}`;
+    const ms = liv.rttMs;
+    const color = ms < 30 ? C.green : ms < 150 ? C.yellow : C.gray;
+    return `${color}${ms.toFixed(0).padStart(3)}ms${C.reset}`;
+  };
+
+  // ── Parte 1: estrella centrada en TÚ ─────────────────────────────
+  const myNeighbors = [...(adj.get(me) ?? [])].sort();
+  out('');
+  out(`  ${C.bold}grafo de conectividad${C.reset}  ${C.dim}(visto desde ti)${C.reset}`);
+  out('');
+  if (myNeighbors.length === 0) {
+    out(`            ${dot(me)} ${name(me)}    ${C.dim}(sin vecinos)${C.reset}`);
+  } else {
+    // Pinto un "abanico" con líneas saliendo del centro.
+    const radius = Math.min(myNeighbors.length, 6);
+    out(`            ${dot(me)} ${name(me)}`);
+    for (let i = 0; i < myNeighbors.length; i++) {
+      const peer = myNeighbors[i]!;
+      const mutual = adj.get(peer)?.has(me) ?? false;
+      const line = mutual ? `${C.green}━━━${C.reset}` : `${C.gray}┄┄┄${C.reset}`;
+      // último elemento usa esquina diferente
+      const branch = i === myNeighbors.length - 1 ? '└─' : '├─';
+      out(`             ${C.gray}${branch}${C.reset}${line} ${dot(peer)} ${name(peer)}   rtt=${fmtRtt(peer)}`);
+    }
+    void radius;
+  }
+
+  // ── Parte 2: tabla de aristas global ─────────────────────────────
+  const otherEdges = edges.filter((e) => e.a !== me && e.b !== me);
+  if (otherEdges.length > 0) {
+    out('');
+    out(`  ${C.bold}aristas entre otros peers (vía gossip)${C.reset}`);
+    for (const e of otherEdges) {
+      const line = e.mutual ? `${C.green}━━━${C.reset}` : `${C.gray}┄┄┄${C.reset}`;
+      out(`    ${dot(e.a)} ${name(e.a)} ${line} ${dot(e.b)} ${name(e.b)}`);
+    }
+  }
+
+  // ── Parte 3: métricas ────────────────────────────────────────────
+  const mutuals = edges.filter((e) => e.mutual).length;
+  const oneway = edges.length - mutuals;
+  const n = nodes.length;
   const maxEdges = (n * (n - 1)) / 2;
-  const density = maxEdges > 0 ? (mutual / maxEdges).toFixed(2) : '0.00';
-  out('  ─────────────────────────────────────────────────────────');
-  out(`  nodos=${n}  aristas mutuas=${mutual}  unidireccionales=${oneway}  densidad=${density}`);
-  out('  leyenda: ==  conexión mutua    →  un solo sentido (gossip parcial)');
-  out('  └──────────────────────────────────────────────────────────┘');
+  const density = maxEdges > 0 ? (mutuals / maxEdges).toFixed(2) : '0.00';
+  out('');
+  out(
+    `  ${C.dim}nodos=${n}  mutuas=${mutuals}  unidireccionales=${oneway}  densidad=${density}${C.reset}`,
+  );
+  out(
+    `  ${C.dim}leyenda: ${C.green}━━━${C.dim} mutua   ${C.gray}┄┄┄${C.dim} un sentido (gossip parcial)${C.reset}`,
+  );
+  out(`  ${C.dim}tip: \`graph open\` para verlo en el navegador${C.reset}`);
+  out('');
+}
+
+/**
+ * Genera un HTML autocontenido con vis-network (CDN) que dibuja el grafo
+ * de forma interactiva (arrastrar nodos, zoom, etc). Lo guarda en tmpdir
+ * y lo abre con el comando estándar de la plataforma.
+ */
+function renderGraphHtml(out: (s: string) => void, ctx: CliCtx): void {
+  const { nodes, edges, adj } = buildGraph(ctx);
+  if (nodes.length === 0) { out('(sin peers conocidos)'); return; }
+  const me = ctx.peerId;
+
+  const visNodes = nodes.map((pid) => ({
+    id: pid,
+    label: shortId(pid) + (pid === me ? '\n(tú)' : ''),
+    color: pid === me
+      ? { background: '#2ecc71', border: '#27ae60' }
+      : { background: '#3498db', border: '#2980b9' },
+    size: pid === me ? 28 : 22,
+    font: { color: '#ffffff', size: 14, face: 'monospace' },
+    title: pid + (ctx.state.liveness.get(pid)?.rttMs !== undefined
+      ? `\nRTT ≈ ${ctx.state.liveness.get(pid)!.rttMs!.toFixed(0)}ms`
+      : ''),
+  }));
+
+  const visEdges = edges.map((e) => ({
+    from: e.a,
+    to: e.b,
+    dashes: !e.mutual,
+    color: { color: e.mutual ? '#27ae60' : '#7f8c8d' },
+    width: e.mutual ? 2 : 1,
+  }));
+
+  // Estadísticas para mostrar en el header.
+  const mutuals = edges.filter((e) => e.mutual).length;
+  const oneway = edges.length - mutuals;
+  const density = nodes.length > 1
+    ? (mutuals / ((nodes.length * (nodes.length - 1)) / 2)).toFixed(2)
+    : '0.00';
+  void adj;
+
+  const dataPayload = JSON.stringify({ nodes: visNodes, edges: visEdges });
+  const html = `<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>p2p-chat — grafo de peers</title>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0f1117; color:#e6e6e6;
+               font-family: -apple-system, system-ui, "Segoe UI", sans-serif; }
+  #header { padding: 12px 20px; border-bottom: 1px solid #222; display:flex; align-items:center; gap:16px; }
+  #header h1 { margin:0; font-size:16px; font-weight:600; }
+  #header .stats { font-size:12px; color:#8a8f99; }
+  #header .legend { margin-left:auto; font-size:12px; color:#8a8f99; }
+  #header .legend span { margin-right:12px; }
+  #header .swatch { display:inline-block; width:14px; height:2px; vertical-align:middle; margin-right:4px; }
+  #net { width:100%; height: calc(100% - 50px); }
+  .me   { color:#2ecc71; font-weight:bold; }
+  .peer { color:#3498db; }
+  .solid { background:#27ae60; }
+  .dashed { background:#7f8c8d; }
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>Grafo de peers <span class="peer">p2p-chat</span></h1>
+  <div class="stats">nodos=${nodes.length} · mutuas=${mutuals} · un sentido=${oneway} · densidad=${density}</div>
+  <div class="legend">
+    <span><span class="swatch solid"></span>mutua</span>
+    <span><span class="swatch dashed"></span>un sentido</span>
+    <span class="me">● tú</span>
+    <span class="peer">● otros</span>
+  </div>
+</div>
+<div id="net"></div>
+<script>
+  const raw = ${dataPayload};
+  const data = {
+    nodes: new vis.DataSet(raw.nodes),
+    edges: new vis.DataSet(raw.edges),
+  };
+  new vis.Network(document.getElementById('net'), data, {
+    nodes: { shape: 'dot' },
+    edges: { smooth: { type: 'continuous' } },
+    physics: { stabilization: true, barnesHut: { springLength: 180, gravitationalConstant: -3000 } },
+    interaction: { hover: true, dragNodes: true },
+  });
+</script>
+</body>
+</html>`;
+
+  const file = path.join(tmpdir(), `p2p-chat-graph-${Date.now()}.html`);
+  fsWriteFileSync(file, html, 'utf8');
+  out(`  grafo escrito en ${file}`);
+  openInBrowser(file);
+}
+
+/**
+ * Abre un fichero local en el navegador por defecto. Cross-platform:
+ *   - Windows: `cmd /c start "" <file>`  ("" es el título obligatorio
+ *              cuando hay un argumento con espacios; sin él, start trata el
+ *              primer arg como título y no abre nada).
+ *   - macOS:   `open <file>`
+ *   - Linux:   `xdg-open <file>`
+ */
+function openInBrowser(file: string): void {
+  if (process.platform === 'win32') {
+    spawnDetached('cmd', ['/c', 'start', '""', file]);
+  } else if (process.platform === 'darwin') {
+    spawnDetached('open', [file]);
+  } else {
+    spawnDetached('xdg-open', [file]);
+  }
+}
+
+function spawnDetached(cmd: string, args: string[]): void {
+  // detached + unref para que el chat siga andando si el navegador tarda.
+  try {
+    const child = spawnChild(cmd, args, { detached: true, stdio: 'ignore' });
+    child.unref();
+  } catch {
+    /* no-op: el usuario verá la ruta en stdout y puede abrirla a mano */
+  }
 }
 
 bootstrap().catch((err) => {
