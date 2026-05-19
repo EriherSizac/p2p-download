@@ -27,7 +27,10 @@ import { isSupported as fwSupported, ruleExistsForPort, requestFirewallRule } fr
 
 const log = createLogger('main');
 
-const TCP_PORT = Number(process.env['TCP_PORT'] ?? 0);
+// Puerto TCP fijo por defecto (41237). Con un fijo basta UNA regla de
+// firewall inbound y persiste entre arranques. Override con `TCP_PORT=<otro>`
+// si necesitas otra instancia paralela (y crea otra regla).
+const TCP_PORT = Number(process.env['TCP_PORT'] ?? 41237);
 const DISCOVERY_PORT = Number(process.env['DISCOVERY_PORT'] ?? 41234);
 const SHARED_DIR = path.resolve(process.env['SHARED_DIR'] ?? './shared');
 const DOWNLOAD_DIR = path.resolve(process.env['DOWNLOAD_DIR'] ?? './downloads');

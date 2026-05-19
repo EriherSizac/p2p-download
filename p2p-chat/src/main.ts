@@ -38,7 +38,11 @@ import { GraphServer, type GraphSnapshot } from './graph-server.js';
 
 const log = createLogger('main');
 
-const TCP_PORT = Number(process.env['TCP_PORT'] ?? 0);
+// Puerto TCP fijo por defecto (41236). Razón: si fuese efímero, cada arranque
+// cambiaría el puerto y habría que recrear la regla de firewall — molesto.
+// Con un fijo, basta UNA regla inbound. Si necesitas varias instancias en la
+// misma máquina, override con `TCP_PORT=<otro>` y crea otra regla.
+const TCP_PORT = Number(process.env['TCP_PORT'] ?? 41236);
 // Puerto distinto al de p2p-files (41234) para que ambos puedan coexistir
 // en la misma LAN sin confundir sus enjambres.
 const DISCOVERY_PORT = Number(process.env['DISCOVERY_PORT'] ?? 41235);

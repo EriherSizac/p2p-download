@@ -61,7 +61,17 @@ export class Transport extends EventEmitter {
   async start(): Promise<number> {
     this.server = net.createServer((socket) => this.acceptIncoming(socket));
     await new Promise<void>((resolve, reject) => {
-      this.server.once('error', reject);
+      // Si el puerto fijo está ocupado, mensaje claro. NO caemos a efímero
+      // porque romperíamos la regla de firewall ya creada.
+      this.server.once('error', (err: NodeJS.ErrnoException) => {
+        if (err.code === 'EADDRINUSE') {
+          reject(new Error(
+            `puerto TCP ${this.opts.tcpPort} ocupado. ` +
+            `Cierra la otra instancia o lanza con \`TCP_PORT=<otro> npm run dev\`. ` +
+            `Si usas otro puerto, recuerda actualizar la regla de firewall.`,
+          ));
+        } else reject(err);
+      });
       this.server.listen(this.opts.tcpPort, '0.0.0.0', () => {
         const addr = this.server.address();
         if (addr && typeof addr === 'object') this.actualPort = addr.port;
