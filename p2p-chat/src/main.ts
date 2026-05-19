@@ -34,7 +34,7 @@ import { createLogger } from './logger.js';
 import { append as histAppend, tail as histTail, filePath as histPath } from './history.js';
 import { Call } from './call.js';
 import { isSupported as fwSupported, ruleExistsForPort, udpRuleExists, requestFirewallRule } from './firewall.js';
-import { GraphServer, type GraphSnapshot } from './graph-server.js';
+import { GraphServer, type GraphSnapshot, type GraphActions } from './graph-server.js';
 
 const log = createLogger('main');
 
@@ -141,10 +141,23 @@ async function bootstrap(): Promise<void> {
   const liveness = new Map<string, PeerLiveness>();
 
   // Gossip de topología: lo que CADA peer remoto nos dice que conoce.
-  // Clave = peerId del informante. Valor = peerIds que él conoce
-  // (sus conexiones activas + nosotros). Con esto reconstruimos el grafo
-  // global aunque solo estemos conectados directamente a un subconjunto.
   const peerLists = new Map<string, { peers: string[]; ts: number }>();
+
+  // Historial reciente por peer (capado) — alimenta el panel lateral del
+  // grafo en vivo. Va aparte del histAppend (que escribe a disco): aquí
+  // solo necesitamos los últimos N en memoria para mostrar al usuario.
+  const RECENT_CAP = 30;
+  const recentByPeer = new Map<string, Array<{ ts: number; dir: 'in' | 'out'; text: string }>>();
+  const pushRecent = (pid: string, entry: { ts: number; dir: 'in' | 'out'; text: string }): void => {
+    let arr = recentByPeer.get(pid);
+    if (!arr) { arr = []; recentByPeer.set(pid, arr); }
+    arr.push(entry);
+    if (arr.length > RECENT_CAP) arr.shift();
+  };
+
+  // Contador "sin leer" por peer. Incrementa al recibir CHAT; resetea al
+  // abrir el panel del peer en el grafo web (vía /api/read).
+  const unreadByPeer = new Map<string, number>();
 
   // Estado de llamadas activas. Solo una concurrente por peer remoto (simple).
   const calls = new Map<string, Call>(); // callId → Call
@@ -244,12 +257,64 @@ async function bootstrap(): Promise<void> {
     if (!graphServer) {
       graphServer = new GraphServer();
       await graphServer.start();
+      graphServer.setActions(buildGraphActions());
     }
     // Snapshot inicial: el server lo entrega a clientes que se conecten.
     graphServer.emit(buildSnapshot());
     openInBrowser(graphServer.url());
     return graphServer.url();
   };
+
+  /**
+   * Construye el objeto GraphActions que el server expondrá vía /api/*.
+   * Cada método cierra sobre el estado de bootstrap (transport, peerLists,
+   * recentByPeer, etc.). De esta forma el server no necesita conocer la
+   * estructura interna del chat.
+   */
+  function buildGraphActions(): GraphActions {
+    return {
+      sendDm(to, text) {
+        const ok = transport.send(to, {
+          type: MSG.CHAT,
+          messageId: newMessageId(),
+          text,
+          ts: Date.now(),
+        });
+        if (ok) {
+          const ts = Date.now();
+          void histAppend({ ts, dir: 'out', peerId: to, messageId: newMessageId(), text });
+          pushRecent(to, { ts, dir: 'out', text });
+        }
+        return ok;
+      },
+      async startCall(to, source) {
+        if (callsByPeer.has(to)) return { ok: false, error: `ya hay llamada con ${shortId(to)}` };
+        if (!transport.isConnected(to)) return { ok: false, error: 'sin conexión TCP a ese peer' };
+        const callId = newCallId();
+        const call = spawnCall({ remotePeerId: to, callId, role: 'caller', source: source ?? 'tone' });
+        await call.start();
+        return { ok: true };
+      },
+      peerInfo(peerId) {
+        const liv = liveness.get(peerId);
+        const recent = (recentByPeer.get(peerId) ?? []).slice(-15);
+        return {
+          peerId,
+          rttMs: liv?.rttMs,
+          isMe: peerId === ctx_peerId(),
+          isConnected: transport.isConnected(peerId),
+          recent,
+          unread: unreadByPeer.get(peerId) ?? 0,
+        };
+      },
+      markRead(peerId) {
+        unreadByPeer.delete(peerId);
+      },
+    };
+  }
+  // Tiny helper para evitar declarar `peerId` doble dentro del closure de
+  // buildGraphActions (TS prefiere accessor explícito).
+  const ctx_peerId = (): string => peerId;
 
   // ---------------------------------------------------------------------
   // Manejo de mensajes entrantes.
@@ -311,6 +376,12 @@ async function bootstrap(): Promise<void> {
           messageId: msg.messageId,
           text: msg.text,
         });
+        // 4) Caches en memoria para el panel web + badge sin leer.
+        pushRecent(from, { ts: msg.ts, dir: 'in', text: msg.text });
+        unreadByPeer.set(from, (unreadByPeer.get(from) ?? 0) + 1);
+        // 5) Pulso visual en el nodo emisor — feedback inmediato sin
+        //    necesidad de tener el panel abierto.
+        graphServer?.highlight(from, { color: '#3498db', label: '💬 msg' });
         break;
       }
 
@@ -518,6 +589,8 @@ async function bootstrap(): Promise<void> {
     sinks: cliSinks,
     state: { pendingAcks, liveness, calls, callsByPeer, peerLists },
     openLiveGraph,
+    graphHighlight: (pid, opts) => graphServer?.highlight(pid, opts),
+    pushRecent,
     pending: {
       get incomingOffer() { return pendingIncomingOffer; },
       clear() { pendingIncomingOffer = undefined; },
@@ -562,6 +635,10 @@ interface CliCtx {
   };
   spawnCall(opts: { remotePeerId: string; callId: string; role: 'caller' | 'callee'; source?: string }): Call;
   openLiveGraph(): Promise<string>;
+  /** Empuja un pulso visual al grafo web (no-op si server no arrancó). */
+  graphHighlight?: (peerId: string, opts?: { color?: string; label?: string }) => void;
+  /** Empuja una entrada al cache `recentByPeer` para el panel web. */
+  pushRecent?: (peerId: string, entry: { ts: number; dir: 'in' | 'out'; text: string }) => void;
 }
 
 function setupCli(ctx: CliCtx): void {
@@ -588,6 +665,9 @@ function setupCli(ctx: CliCtx): void {
     out('  │  peers                    peers descubiertos + RTT       │');
     out('  │  who                      peers conectados + RTT         │');
     out('  │  graph [open]             grafo ASCII | live HTML+SSE    │');
+    out('  │  ping <peerId>            pulso visual en grafo web       │');
+    out('  │  whisper <peerId> <txt>   DM + pulso verde en grafo web   │');
+    out('  │  highlight <peerId> [c]   marca visual en grafo web       │');
     out('  │  call <peerId> [source]   llamar (source=tone|mic|file:…)│');
     out('  │  answer                   aceptar llamada entrante       │');
     out('  │  hangup                   colgar llamada activa          │');
@@ -646,7 +726,10 @@ function setupCli(ctx: CliCtx): void {
       out(`✗ no entregado: sin conexión a ${shortId(toPeerId)}`);
       return;
     }
-    void histAppend({ ts: Date.now(), dir: 'out', peerId: toPeerId, messageId, text });
+    const ts = Date.now();
+    void histAppend({ ts, dir: 'out', peerId: toPeerId, messageId, text });
+    // Alimentar la vista en vivo del grafo (panel lateral del peer).
+    ctx.pushRecent?.(toPeerId, { ts, dir: 'out', text });
     // Timer "ACK o muerte". Si el peer remoto procesa el CHAT y responde
     // a tiempo, handleMessage(CHAT_ACK) limpiará este timer. Si no, salta
     // y limpiamos pendingAcks nosotros mismos para evitar fugas.
@@ -777,6 +860,45 @@ function setupCli(ctx: CliCtx): void {
             break;
           }
 
+          case 'ping': {
+            // Pulso visual en el grafo web — útil para "señalar" un peer
+            // cuando estás presentando. NO genera tráfico extra (PING/PONG
+            // del protocolo ya corre cada 5s para liveness).
+            const prefix = rest[0];
+            if (!prefix) { out('uso: ping <peerId>'); break; }
+            const target = resolvePeer(prefix);
+            if (!target) { out(`peerId ambiguo o desconocido: ${prefix}`); break; }
+            ctx.graphHighlight?.(target, { color: '#f1c40f', label: '⚡ ping' });
+            out(`⚡ ping → ${shortId(target)} (mira el grafo web)`);
+            break;
+          }
+
+          case 'whisper': {
+            // Whisper = DM con feedback visual extra (pulso verde + toast).
+            const prefix = rest[0];
+            const text = rest.slice(1).join(' ');
+            if (!prefix || !text) { out('uso: whisper <peerId> <texto>'); break; }
+            const target = resolvePeer(prefix);
+            if (!target) { out(`peerId ambiguo o desconocido: ${prefix}`); break; }
+            if (!ctx.transport.isConnected(target)) { out(`sin conexión con ${shortId(target)}`); break; }
+            sendChat(target, text);
+            ctx.graphHighlight?.(target, { color: '#27ae60', label: '🤫 whisper' });
+            out(`🤫 whisper → ${shortId(target)}`);
+            break;
+          }
+
+          case 'highlight': {
+            // Marca visual genérica en el grafo. Solo afecta a la vista web.
+            const prefix = rest[0];
+            if (!prefix) { out('uso: highlight <peerId> [color]'); break; }
+            const target = resolvePeer(prefix);
+            if (!target) { out(`peerId ambiguo o desconocido: ${prefix}`); break; }
+            const color = rest[1] ?? '#9b59b6';
+            ctx.graphHighlight?.(target, { color, label: '★ highlight' });
+            out(`★ highlight → ${shortId(target)}`);
+            break;
+          }
+
           case 'stats': {
             // Diagnóstico de llamada(s) activa(s). Si los paquetes/bytes
             // crecen pero no oyes nada → problema local (volumen, output
@@ -820,7 +942,7 @@ function setupCli(ctx: CliCtx): void {
             process.kill(process.pid, 'SIGINT');
             return;
           case 'help':
-            out('comandos: peers | who | graph [open] | chat <texto> | msg <peerId> <texto> | history [n] | call <peerId> [source] | answer | hangup | stats | firewall | menu | quit');
+            out('comandos: peers | who | graph [open] | chat <texto> | msg <peerId> <texto> | ping <peerId> | whisper <peerId> <txt> | highlight <peerId> [color] | history [n] | call <peerId> [source] | answer | hangup | stats | firewall | menu | quit');
             break;
           default:
             out(`comando desconocido: ${cmd}`);

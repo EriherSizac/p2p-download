@@ -29,6 +29,31 @@ import { createLogger } from './logger.js';
 
 const log = createLogger('graph-server');
 
+/** Callbacks que la capa main expone al server para que el HTML los invoque. */
+export interface GraphActions {
+  /** Envía un DM al peer indicado. Devuelve si pudo entregarse al transport. */
+  sendDm(toPeerId: string, text: string): boolean;
+  /** Inicia una llamada al peer. Source default tone. */
+  startCall(toPeerId: string, source?: string): Promise<{ ok: boolean; error?: string }>;
+  /** Devuelve info ampliada de un peer para el panel lateral. */
+  peerInfo(peerId: string): {
+    peerId: string;
+    rttMs?: number;
+    isMe: boolean;
+    isConnected: boolean;
+    recent: Array<{ ts: number; dir: 'in' | 'out'; text: string }>;
+    unread: number;
+  };
+  /** Marca mensajes con peer como leídos (badge a cero). */
+  markRead(peerId: string): void;
+}
+
+/** Evento push: snapshot completo o highlight puntual (pulso visual). */
+export type GraphEvent =
+  | ({ kind: 'snapshot' } & GraphSnapshot)
+  | { kind: 'highlight'; peerId: string; label?: string; color?: string }
+  | { kind: 'toast'; text: string };
+
 /** Forma del snapshot que mandamos al navegador. */
 export interface GraphSnapshot {
   nodes: Array<{
@@ -56,6 +81,12 @@ export class GraphServer {
   private clients = new Set<http.ServerResponse>();
   private port = 0;
   private lastSnap?: GraphSnapshot;
+  private actions?: GraphActions;
+
+  /** Inyecta las acciones que el frontend podrá disparar vía /api/*. */
+  setActions(actions: GraphActions): void {
+    this.actions = actions;
+  }
 
   /** Arranca el server. Devuelve el puerto efímero asignado por el SO. */
   async start(): Promise<number> {
@@ -79,11 +110,23 @@ export class GraphServer {
   /** Empuja un snapshot a todos los clientes conectados. */
   emit(snap: GraphSnapshot): void {
     this.lastSnap = snap;
-    const payload = `data: ${JSON.stringify(snap)}\n\n`;
+    this.broadcast({ kind: 'snapshot', ...snap });
+  }
+
+  /** Empuja un evento "highlight" para que el HTML resalte/pulse un nodo. */
+  highlight(peerId: string, opts?: { label?: string; color?: string }): void {
+    this.broadcast({ kind: 'highlight', peerId, label: opts?.label, color: opts?.color });
+  }
+
+  /** Empuja un toast informativo (esquina del HTML). */
+  toast(text: string): void {
+    this.broadcast({ kind: 'toast', text });
+  }
+
+  private broadcast(ev: GraphEvent): void {
+    const payload = `data: ${JSON.stringify(ev)}\n\n`;
     for (const c of this.clients) {
-      // try/catch porque un cliente puede haberse cerrado a medias.
-      // Si falla, lo quitaremos en su evento 'close'.
-      try { c.write(payload); } catch { /* ignore */ }
+      try { c.write(payload); } catch { /* ignore: cleanup en close */ }
     }
   }
 
@@ -106,13 +149,146 @@ export class GraphServer {
   // -------------------------------------------------------------------------
 
   private handle(req: http.IncomingMessage, res: http.ServerResponse): void {
-    if (req.url === '/events') {
-      this.handleSse(req, res);
-      return;
-    }
-    // Cualquier otra ruta → la página HTML.
+    const url = req.url ?? '/';
+    if (url === '/events') return this.handleSse(req, res);
+
+    // API JSON. Endpoints muy específicos; sin librería HTTP — un switch
+    // simple. Cada handler responde con `{ok:true,...}` o status 4xx/5xx.
+    if (url === '/api/dm' && req.method === 'POST')        { void this.handleDm(req, res); return; }
+    if (url === '/api/whisper' && req.method === 'POST')   { void this.handleWhisper(req, res); return; }
+    if (url === '/api/call' && req.method === 'POST')      { void this.handleCall(req, res); return; }
+    if (url === '/api/ping' && req.method === 'POST')      { void this.handlePing(req, res); return; }
+    if (url === '/api/highlight' && req.method === 'POST') { void this.handleHighlight(req, res); return; }
+    if (url.startsWith('/api/peer/') && req.method === 'GET') { this.handlePeerInfo(url, res); return; }
+    if (url.startsWith('/api/read/') && req.method === 'POST') { this.handleMarkRead(url, res); return; }
+
+    // Default: la página HTML.
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(PAGE_HTML);
+  }
+
+  /** Lee JSON body con límite duro de 16KB para evitar DoS local. */
+  private async readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      req.on('data', (c: Buffer) => {
+        size += c.length;
+        if (size > 16 * 1024) {
+          reject(new Error('body too large'));
+          req.destroy();
+          return;
+        }
+        chunks.push(c);
+      });
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'));
+        } catch (err) {
+          reject(err as Error);
+        }
+      });
+      req.on('error', reject);
+    });
+  }
+
+  private json(res: http.ServerResponse, status: number, obj: unknown): void {
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(obj));
+  }
+
+  private async handleDm(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    if (!this.actions) return this.json(res, 503, { ok: false, error: 'actions not wired' });
+    try {
+      const body = await this.readJson(req);
+      const to = String(body['to'] ?? '');
+      const text = String(body['text'] ?? '').trim();
+      if (!to || !text) return this.json(res, 400, { ok: false, error: 'to+text required' });
+      const ok = this.actions.sendDm(to, text);
+      this.json(res, ok ? 200 : 502, { ok });
+    } catch (err) {
+      this.json(res, 400, { ok: false, error: (err as Error).message });
+    }
+  }
+
+  private async handleCall(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    if (!this.actions) return this.json(res, 503, { ok: false, error: 'actions not wired' });
+    try {
+      const body = await this.readJson(req);
+      const to = String(body['to'] ?? '');
+      const source = body['source'] ? String(body['source']) : undefined;
+      if (!to) return this.json(res, 400, { ok: false, error: 'to required' });
+      const r = await this.actions.startCall(to, source);
+      this.json(res, r.ok ? 200 : 502, r);
+    } catch (err) {
+      this.json(res, 400, { ok: false, error: (err as Error).message });
+    }
+  }
+
+  private handlePeerInfo(url: string, res: http.ServerResponse): void {
+    if (!this.actions) return this.json(res, 503, { ok: false, error: 'actions not wired' });
+    // /api/peer/<peerId>
+    const peerId = decodeURIComponent(url.slice('/api/peer/'.length));
+    if (!peerId) return this.json(res, 400, { ok: false, error: 'peerId required' });
+    this.json(res, 200, { ok: true, info: this.actions.peerInfo(peerId) });
+  }
+
+  private async handleWhisper(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Whisper = DM normal + feedback visual extra (pulso verde en el nodo).
+    // Semánticamente equivalente al DM; el "extra" es solo UX.
+    if (!this.actions) return this.json(res, 503, { ok: false, error: 'actions not wired' });
+    try {
+      const body = await this.readJson(req);
+      const to = String(body['to'] ?? '');
+      const text = String(body['text'] ?? '').trim();
+      if (!to || !text) return this.json(res, 400, { ok: false, error: 'to+text required' });
+      const ok = this.actions.sendDm(to, text);
+      if (ok) {
+        this.highlight(to, { color: '#27ae60', label: '🤫 whisper' });
+        this.toast(`whisper → ${to.slice(0, 8)}: ${text.slice(0, 60)}`);
+      }
+      this.json(res, ok ? 200 : 502, { ok });
+    } catch (err) {
+      this.json(res, 400, { ok: false, error: (err as Error).message });
+    }
+  }
+
+  private async handlePing(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Ping desde web: pulso visual amarillo. No genera tráfico nuevo (el
+    // protocolo PING/PONG ya corre cada 5s para liveness). Es señal local.
+    try {
+      const body = await this.readJson(req);
+      const to = String(body['to'] ?? '');
+      if (!to) return this.json(res, 400, { ok: false, error: 'to required' });
+      this.highlight(to, { color: '#f1c40f', label: '⚡ ping' });
+      this.toast(`ping → ${to.slice(0, 8)}`);
+      this.json(res, 200, { ok: true });
+    } catch (err) {
+      this.json(res, 400, { ok: false, error: (err as Error).message });
+    }
+  }
+
+  private async handleHighlight(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Highlight genérico: marcar visualmente un peer. Color/label opcionales.
+    try {
+      const body = await this.readJson(req);
+      const to = String(body['to'] ?? '');
+      if (!to) return this.json(res, 400, { ok: false, error: 'to required' });
+      const color = body['color'] ? String(body['color']) : '#9b59b6';
+      const label = body['label'] ? String(body['label']) : '★ highlight';
+      this.highlight(to, { color, label });
+      this.json(res, 200, { ok: true });
+    } catch (err) {
+      this.json(res, 400, { ok: false, error: (err as Error).message });
+    }
+  }
+
+  private handleMarkRead(url: string, res: http.ServerResponse): void {
+    if (!this.actions) return this.json(res, 503, { ok: false, error: 'actions not wired' });
+    const peerId = decodeURIComponent(url.slice('/api/read/'.length));
+    if (!peerId) return this.json(res, 400, { ok: false, error: 'peerId required' });
+    this.actions.markRead(peerId);
+    this.json(res, 200, { ok: true });
   }
 
   private handleSse(req: http.IncomingMessage, res: http.ServerResponse): void {
@@ -164,40 +340,88 @@ const PAGE_HTML = `<!doctype html>
 <style>
   html, body { margin:0; padding:0; height:100%; background:#0f1117; color:#e6e6e6;
                font-family: -apple-system, system-ui, "Segoe UI", sans-serif; }
+  #app { display:flex; height:100%; flex-direction:column; }
   #header { padding: 10px 18px; border-bottom: 1px solid #222; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
   #header h1 { margin:0; font-size:15px; font-weight:600; }
   #header .stats { font-size:12px; color:#8a8f99; font-family: ui-monospace, monospace; }
   #header .legend { margin-left:auto; font-size:11px; color:#8a8f99; }
   #header .legend span { margin-right:10px; }
   #header .swatch { display:inline-block; width:14px; height:2px; vertical-align:middle; margin-right:4px; }
-  #header .pulse { width:8px; height:8px; border-radius:50%; background:#2ecc71; display:inline-block; vertical-align:middle; margin-right:6px; animation: pulse 1.2s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  #header .pulse { width:8px; height:8px; border-radius:50%; background:#2ecc71; display:inline-block; vertical-align:middle; margin-right:6px; animation: blink 1.2s infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
   #status { font-size:11px; color:#8a8f99; }
   #status.off .pulse { background:#e74c3c; animation: none; }
-  #net { width:100%; height: calc(100% - 56px); }
+  #main { display:flex; flex:1; min-height:0; }
+  #net { flex:1; height:100%; }
+  #panel { width:320px; border-left:1px solid #222; padding:16px; overflow-y:auto; background:#13161e; }
+  #panel.hidden { display:none; }
+  #panel h2 { margin:0 0 4px; font-size:14px; font-family: ui-monospace, monospace; word-break:break-all; }
+  #panel .meta { font-size:11px; color:#8a8f99; margin-bottom:14px; }
+  #panel .meta .kv { display:flex; justify-content:space-between; margin-top:3px; }
+  #panel .meta .kv span:last-child { font-family: ui-monospace, monospace; color:#cfd6e1; }
+  #panel .actions { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:14px; }
+  #panel button { background:#1f242e; border:1px solid #2d343f; color:#e6e6e6; padding:6px 10px; border-radius:4px; cursor:pointer; font-size:12px; }
+  #panel button:hover { background:#2a313d; }
+  #panel button.primary { background:#2563eb; border-color:#2563eb; }
+  #panel button.primary:hover { background:#1d4fd6; }
+  #panel button.danger { background:#dc2626; border-color:#dc2626; }
+  #panel textarea { width:100%; box-sizing:border-box; min-height:64px; background:#0f1117; color:#e6e6e6; border:1px solid #2d343f; border-radius:4px; padding:6px; font-family:inherit; font-size:12px; resize:vertical; }
+  #panel .recent { margin-top:14px; }
+  #panel .recent h3 { font-size:12px; color:#8a8f99; text-transform:uppercase; letter-spacing:0.05em; margin:0 0 6px; }
+  #panel .recent .msg { font-size:12px; padding:4px 0; border-bottom:1px solid #1a1f29; }
+  #panel .recent .msg .dir { display:inline-block; width:14px; color:#6b7280; }
+  #panel .recent .msg.in .dir { color:#3498db; }
+  #panel .recent .msg.out .dir { color:#2ecc71; }
+  #panel .recent .msg .t { color:#6b7280; font-size:10px; margin-left:6px; }
+  #panel .close { float:right; cursor:pointer; color:#8a8f99; font-size:18px; line-height:1; }
   .me   { color:#2ecc71; font-weight:bold; }
   .peer { color:#3498db; }
   .solid { background:#27ae60; }
   .dashed { background:#7f8c8d; }
+  #toast-container { position:fixed; bottom:18px; right:18px; display:flex; flex-direction:column; gap:8px; z-index:10; }
+  .toast { background:#1f242e; border:1px solid #2d343f; padding:8px 14px; border-radius:6px; font-size:12px; max-width:340px;
+           animation: slidein .25s ease-out, fadeout .4s ease-in 3.6s forwards; }
+  @keyframes slidein { from { transform: translateX(20px); opacity:0 } to { transform: translateX(0); opacity:1 } }
+  @keyframes fadeout { to { opacity:0; transform: translateX(20px) } }
 </style>
 </head>
 <body>
-<div id="header">
-  <h1>Grafo de peers <span class="peer">p2p-chat</span></h1>
-  <div id="status"><span class="pulse"></span><span id="status-text">conectando…</span></div>
-  <div class="stats" id="stats">—</div>
-  <div class="legend">
-    <span><span class="swatch solid"></span>mutua</span>
-    <span><span class="swatch dashed"></span>un sentido</span>
-    <span class="me">● tú</span>
-    <span class="peer">● otros</span>
+<div id="app">
+  <div id="header">
+    <h1>Grafo de peers <span class="peer">p2p-chat</span></h1>
+    <div id="status"><span class="pulse"></span><span id="status-text">conectando…</span></div>
+    <div class="stats" id="stats">—</div>
+    <div class="legend">
+      <span><span class="swatch solid"></span>mutua</span>
+      <span><span class="swatch dashed"></span>un sentido</span>
+      <span class="me">● tú</span>
+      <span class="peer">● otros</span>
+    </div>
+  </div>
+  <div id="main">
+    <div id="net"></div>
+    <aside id="panel" class="hidden">
+      <span class="close" onclick="window.__hidePanel()">×</span>
+      <h2 id="p-title">—</h2>
+      <div class="meta" id="p-meta"></div>
+      <div class="actions">
+        <button class="primary" onclick="window.__sendDm()">enviar DM</button>
+        <button onclick="window.__sendWhisper()">🤫 whisper</button>
+        <button onclick="window.__sendPing()">⚡ ping</button>
+        <button onclick="window.__doHighlight()">★ highlight</button>
+        <button onclick="window.__doCall()">📞 llamar</button>
+      </div>
+      <textarea id="p-text" placeholder="texto del mensaje…"></textarea>
+      <div class="recent">
+        <h3>recientes</h3>
+        <div id="p-recent">(carga al seleccionar peer)</div>
+      </div>
+    </aside>
   </div>
 </div>
-<div id="net"></div>
+<div id="toast-container"></div>
 <script>
 (function () {
-  // DataSets vacíos al inicio. Cada update del SSE los modifica in-place;
-  // vis-network observa los cambios y anima nodos/aristas.
   const nodes = new vis.DataSet([]);
   const edges = new vis.DataSet([]);
   const container = document.getElementById('net');
@@ -205,7 +429,7 @@ const PAGE_HTML = `<!doctype html>
     nodes: { shape: 'dot', font: { color: '#fff', size: 14, face: 'monospace' } },
     edges: { smooth: { type: 'continuous' } },
     physics: {
-      stabilization: false, // queremos movimiento continuo, no equilibrio rígido
+      stabilization: false,
       barnesHut: { springLength: 180, gravitationalConstant: -3500, damping: 0.4 },
     },
     interaction: { hover: true, dragNodes: true, tooltipDelay: 100 },
@@ -214,47 +438,157 @@ const PAGE_HTML = `<!doctype html>
   const statusEl     = document.getElementById('status');
   const statusTextEl = document.getElementById('status-text');
   const statsEl      = document.getElementById('stats');
+  const panelEl      = document.getElementById('panel');
+  const pTitle       = document.getElementById('p-title');
+  const pMeta        = document.getElementById('p-meta');
+  const pText        = document.getElementById('p-text');
+  const pRecent      = document.getElementById('p-recent');
+  const toastContainer = document.getElementById('toast-container');
+
+  // Color/tamaño original por nodo, para restaurar después de highlight.
+  const originalAttrs = new Map();
+  // Peer actualmente abierto en el panel.
+  let selectedPeer = null;
 
   function setStatus(text, on) {
     statusTextEl.textContent = text;
     statusEl.classList.toggle('off', !on);
   }
 
-  /**
-   * Aplica un snapshot al DataSet. Diff manual:
-   *   1) elimina nodos/aristas que ya no existen
-   *   2) update() añade los nuevos y actualiza los ya existentes
-   * DataSet.update() es idempotente y dispara animaciones suaves.
-   */
   function applySnapshot(snap) {
     const newNodeIds = new Set(snap.nodes.map(n => n.id));
     const newEdgeIds = new Set(snap.edges.map(e => e.id));
-
-    for (const id of nodes.getIds()) {
-      if (!newNodeIds.has(id)) nodes.remove(id);
-    }
-    for (const id of edges.getIds()) {
-      if (!newEdgeIds.has(id)) edges.remove(id);
-    }
+    for (const id of nodes.getIds()) if (!newNodeIds.has(id)) { nodes.remove(id); originalAttrs.delete(id); }
+    for (const id of edges.getIds()) if (!newEdgeIds.has(id)) edges.remove(id);
     nodes.update(snap.nodes);
     edges.update(snap.edges);
+    // Refrescar copia de atributos originales para nodos nuevos/cambiados.
+    for (const n of snap.nodes) originalAttrs.set(n.id, { color: n.color, size: n.size });
 
     const s = snap.stats;
     const when = new Date(snap.ts).toLocaleTimeString();
     statsEl.textContent = 'nodos=' + s.total + ' · mutuas=' + s.mutuals + ' · un sentido=' + s.oneway + ' · densidad=' + s.density + '  ·  actualizado ' + when;
+    if (selectedPeer) refreshPanel(selectedPeer); // mantener panel sincronizado
   }
 
-  // EventSource = wrapper estándar del navegador para SSE. Hace reconexión
-  // automática si la conexión se cae (con backoff).
+  function applyHighlight(ev) {
+    const orig = originalAttrs.get(ev.peerId);
+    if (!orig) return;
+    // Color y tamaño temporales; vis-network anima la transición.
+    nodes.update({ id: ev.peerId, color: { background: ev.color, border: ev.color }, size: orig.size + 14 });
+    // Tras ~1.2s, restaurar.
+    setTimeout(() => {
+      const cur = nodes.get(ev.peerId);
+      if (cur) nodes.update({ id: ev.peerId, color: orig.color, size: orig.size });
+    }, 1200);
+  }
+
+  function showToast(text) {
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.textContent = text;
+    toastContainer.appendChild(el);
+    setTimeout(() => el.remove(), 4500);
+  }
+
+  async function refreshPanel(peerId) {
+    selectedPeer = peerId;
+    panelEl.classList.remove('hidden');
+    pTitle.textContent = peerId;
+    try {
+      const r = await fetch('/api/peer/' + encodeURIComponent(peerId));
+      const j = await r.json();
+      if (!j.ok) { pMeta.textContent = j.error || 'error'; return; }
+      const info = j.info;
+      const rtt = info.rttMs !== undefined ? info.rttMs.toFixed(0) + ' ms' : '—';
+      pMeta.innerHTML =
+        '<div class="kv"><span>conectado</span><span>' + (info.isConnected ? 'sí' : 'no') + '</span></div>' +
+        '<div class="kv"><span>RTT</span><span>' + rtt + '</span></div>' +
+        '<div class="kv"><span>tú</span><span>' + (info.isMe ? 'sí' : 'no') + '</span></div>' +
+        '<div class="kv"><span>sin leer</span><span>' + info.unread + '</span></div>';
+      // Marcar como leídos al abrir el panel.
+      if (info.unread > 0) fetch('/api/read/' + encodeURIComponent(peerId), { method: 'POST' });
+      // Recientes
+      pRecent.innerHTML = info.recent.length === 0
+        ? '<div style="color:#6b7280;font-size:12px">(sin mensajes)</div>'
+        : info.recent.map(m => {
+            const arrow = m.dir === 'in' ? '←' : '→';
+            const cls   = m.dir;
+            const t = new Date(m.ts).toLocaleTimeString();
+            const text = m.text.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+            return '<div class="msg ' + cls + '"><span class="dir">' + arrow + '</span>' + text + '<span class="t">' + t + '</span></div>';
+          }).join('');
+    } catch (err) {
+      pMeta.textContent = 'error: ' + err.message;
+    }
+  }
+
+  // ── API helpers ───────────────────────────────────────────────────
+  async function api(path, body) {
+    try {
+      const r = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (!j.ok) showToast('error: ' + (j.error || 'unknown'));
+      return j;
+    } catch (err) {
+      showToast('error: ' + err.message);
+      return { ok: false };
+    }
+  }
+
+  // ── Acciones expuestas a botones ──────────────────────────────────
+  window.__hidePanel = () => { panelEl.classList.add('hidden'); selectedPeer = null; };
+  window.__sendDm = async () => {
+    if (!selectedPeer) return;
+    const text = pText.value.trim();
+    if (!text) { showToast('escribe algo primero'); return; }
+    const r = await api('/api/dm', { to: selectedPeer, text });
+    if (r.ok) { pText.value = ''; showToast('DM enviado'); refreshPanel(selectedPeer); }
+  };
+  window.__sendWhisper = async () => {
+    if (!selectedPeer) return;
+    const text = pText.value.trim();
+    if (!text) { showToast('escribe algo primero'); return; }
+    const r = await api('/api/whisper', { to: selectedPeer, text });
+    if (r.ok) { pText.value = ''; refreshPanel(selectedPeer); }
+  };
+  window.__sendPing = async () => {
+    if (!selectedPeer) return;
+    await api('/api/ping', { to: selectedPeer });
+  };
+  window.__doHighlight = async () => {
+    if (!selectedPeer) return;
+    await api('/api/highlight', { to: selectedPeer });
+  };
+  window.__doCall = async () => {
+    if (!selectedPeer) return;
+    const r = await api('/api/call', { to: selectedPeer });
+    if (r.ok) showToast('llamando…'); else showToast('no se pudo llamar: ' + (r.error || ''));
+  };
+
+  // Click en nodo → abrir panel
+  network.on('selectNode', (params) => {
+    const id = params.nodes[0];
+    if (id) refreshPanel(id);
+  });
+  network.on('deselectNode', () => window.__hidePanel());
+
+  // ── SSE ───────────────────────────────────────────────────────────
   const ev = new EventSource('/events');
   ev.onopen = () => setStatus('en vivo', true);
   ev.onerror = () => setStatus('reconectando…', false);
   ev.onmessage = (m) => {
     try {
-      const snap = JSON.parse(m.data);
-      applySnapshot(snap);
+      const data = JSON.parse(m.data);
+      if (data.kind === 'snapshot') applySnapshot(data);
+      else if (data.kind === 'highlight') applyHighlight(data);
+      else if (data.kind === 'toast') showToast(data.text);
     } catch (err) {
-      console.error('snapshot inválido', err);
+      console.error('evento inválido', err);
     }
   };
 })();
