@@ -153,7 +153,9 @@ async function bootstrap(): Promise<void> {
       case MSG.PING:
         // Responder con PONG mismo nonce. NO añadimos timestamp aquí: el
         // RTT se mide en el lado que pingó (él sabe cuándo mandó cada nonce).
+      
         transport.send(from, { type: MSG.PONG, nonce: msg.nonce });
+        
         break;
 
       case MSG.PONG: {
