@@ -270,18 +270,28 @@ export class AudioReceiver {
     //   -fflags nobuffer / -flags low_delay → minimizan buffer y latencia.
     //   -nodisp                          → audio-only (no ventana SDL).
     //   -autoexit                        → al cortarse el flujo, salir.
-    //   -loglevel warning                → menos ruido en stderr.
+    //   -loglevel info                   → ver init SDL/decoder; si hay
+    //      "no audio device" o similar, sale aquí.
     const args = [
       '-protocol_whitelist', 'file,rtp,udp',
       '-fflags', 'nobuffer',
       '-flags', 'low_delay',
       '-nodisp',
       '-autoexit',
-      '-loglevel', 'warning',
+      '-loglevel', 'info',
       '-i', this.sdpPath!,
     ];
+    // Env override SDL en Windows. Razón: el backend WASAPI de SDL2 a veces
+    // no inicializa en subprocesos sin loop de mensajes (caso típico al
+    // lanzar ffplay desde Node). DirectSound es más tolerante. Si el usuario
+    // ya tiene SDL_AUDIODRIVER definido, respetamos su elección.
+    const env = { ...process.env };
+    if (process.platform === 'win32' && !env['SDL_AUDIODRIVER']) {
+      env['SDL_AUDIODRIVER'] = 'directsound';
+    }
     log.info(`ffplay receiver: ffplay ${args.join(' ')}`);
-    this.ffplay = spawn('ffplay', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    if (env['SDL_AUDIODRIVER']) log.info(`  SDL_AUDIODRIVER=${env['SDL_AUDIODRIVER']}`);
+    this.ffplay = spawn('ffplay', args, { stdio: ['ignore', 'ignore', 'pipe'], env });
     // Subimos ffplay stderr a INFO: si algo va mal (no audio device, codec
     // raro, etc.) el mensaje sale en consola sin tener que activar debug.
     this.ffplay.stderr?.on('data', (b: Buffer) => {
