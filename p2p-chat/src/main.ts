@@ -591,6 +591,7 @@ function setupCli(ctx: CliCtx): void {
     out('  │  call <peerId> [source]   llamar (source=tone|mic|file:…)│');
     out('  │  answer                   aceptar llamada entrante       │');
     out('  │  hangup                   colgar llamada activa          │');
+    out('  │  stats                    diag rx (paquetes/bytes) llam.  │');
     out('  │  firewall                 abrir regla inbound (UAC)      │');
     out('  │  menu | help | quit                                      │');
     out('  └──────────────────────────────────────────────────────────┘');
@@ -776,6 +777,25 @@ function setupCli(ctx: CliCtx): void {
             break;
           }
 
+          case 'stats': {
+            // Diagnóstico de llamada(s) activa(s). Si los paquetes/bytes
+            // crecen pero no oyes nada → problema local (volumen, output
+            // device de Windows, ffplay sin SDL audio). Si están a 0 →
+            // problema de red/ICE/decoder.
+            if (ctx.state.calls.size === 0) { out('(no hay llamadas activas)'); break; }
+            for (const call of ctx.state.calls.values()) {
+              const s = call.getRxStats();
+              const rttLiv = ctx.state.liveness.get(call.remotePeerId);
+              const rtt = rttLiv?.rttMs !== undefined ? `${rttLiv.rttMs.toFixed(0)}ms` : '—';
+              out(`  callId=${call.callId}  estado=${call.getState()}  peer=${shortId(call.remotePeerId)}`);
+              out(`    rx: ${s.packets} paquetes · ${s.bytes} bytes · rtt(señal)=${rtt}`);
+              if (s.packets === 0) {
+                out('    ⚠ 0 paquetes recibidos — revisa firewall UDP y mic del peer remoto');
+              }
+            }
+            break;
+          }
+
           case 'hangup': {
             if (ctx.pending.incomingOffer) {
               const o = ctx.pending.incomingOffer;
@@ -800,7 +820,7 @@ function setupCli(ctx: CliCtx): void {
             process.kill(process.pid, 'SIGINT');
             return;
           case 'help':
-            out('comandos: peers | who | graph [open] | chat <texto> | msg <peerId> <texto> | history [n] | call <peerId> [source] | answer | hangup | firewall | menu | quit');
+            out('comandos: peers | who | graph [open] | chat <texto> | msg <peerId> <texto> | history [n] | call <peerId> [source] | answer | hangup | stats | firewall | menu | quit');
             break;
           default:
             out(`comando desconocido: ${cmd}`);

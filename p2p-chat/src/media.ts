@@ -282,13 +282,15 @@ export class AudioReceiver {
     ];
     log.info(`ffplay receiver: ffplay ${args.join(' ')}`);
     this.ffplay = spawn('ffplay', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    // Subimos ffplay stderr a INFO: si algo va mal (no audio device, codec
+    // raro, etc.) el mensaje sale en consola sin tener que activar debug.
     this.ffplay.stderr?.on('data', (b: Buffer) => {
       const s = b.toString('utf8').trim();
-      if (s) log.debug(`[ffplay-rx] ${s}`);
+      if (s) log.info(`[ffplay] ${s}`);
     });
     this.ffplay.on('error', (err) => {
       log.warn(`ffplay no se pudo lanzar: ${err.message}. Reproducción desactivada.`);
     });
-    this.ffplay.on('exit', (code) => log.debug(`[ffplay-rx] exit=${code}`));
+    this.ffplay.on('exit', (code) => log.info(`[ffplay] exit code=${code}`));
   }
 }
