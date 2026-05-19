@@ -32,7 +32,7 @@ import {
 import { createLogger } from './logger.js';
 import { append as histAppend, tail as histTail, filePath as histPath } from './history.js';
 import { Call } from './call.js';
-import { isSupported as fwSupported, ruleExistsForPort, requestFirewallRule } from './firewall.js';
+import { isSupported as fwSupported, ruleExistsForPort, udpRuleExists, requestFirewallRule } from './firewall.js';
 
 const log = createLogger('main');
 
@@ -89,20 +89,24 @@ async function bootstrap(): Promise<void> {
   // puerto, ofrecer crearla (UAC) ANTES de empezar a descubrir peers.
   // Evita que el primer round de conexiones muera por ETIMEDOUT.
   if (fwSupported()) {
-    const ok = await ruleExistsForPort(actualPort);
-    if (!ok) {
+    const tcpOk = await ruleExistsForPort(actualPort);
+    const udpOk = await udpRuleExists();
+    if (!tcpOk || !udpOk) {
+      const missing: string[] = [];
+      if (!tcpOk) missing.push(`TCP :${actualPort} (chat/señalización)`);
+      if (!udpOk) missing.push('UDP node.exe (WebRTC/llamadas)');
       const yes = await askYesNo(
-        `firewall: no hay regla inbound TCP para :${actualPort}. ¿Crearla? (pedirá UAC) [y/N] `,
+        `firewall: faltan reglas inbound → ${missing.join(' + ')}. ¿Crearlas? (pedirá UAC) [y/N] `,
       );
       if (yes) {
         log.info('solicitando elevación…');
-        const created = await requestFirewallRule(actualPort);
-        log.info(created ? `regla creada para :${actualPort}` : 'no se creó la regla (UAC denegado o error)');
+        const created = await requestFirewallRule(actualPort, { udp: !udpOk });
+        log.info(created ? 'reglas creadas' : 'no se crearon (UAC denegado o error)');
       } else {
-        log.warn('firewall sin abrir; peers remotos quizá no puedan conectar.');
+        log.warn('firewall sin abrir; chat/llamadas pueden fallar.');
       }
     } else {
-      log.debug(`firewall: regla para :${actualPort} ya existe`);
+      log.debug(`firewall: reglas TCP :${actualPort} + UDP node.exe ya existen`);
     }
   }
 
@@ -610,11 +614,12 @@ function setupCli(ctx: CliCtx): void {
           case 'firewall': {
             if (!fwSupported()) { out('firewall: solo Windows'); break; }
             const port = ctx.transport.port();
-            const exists = await ruleExistsForPort(port);
-            if (exists) { out(`firewall: regla para :${port} ya existe`); break; }
-            out(`firewall: solicitando UAC para abrir :${port}…`);
-            const ok = await requestFirewallRule(port);
-            out(ok ? `firewall: regla creada para :${port}` : 'firewall: no se creó la regla');
+            const tcpOk = await ruleExistsForPort(port);
+            const udpOk = await udpRuleExists();
+            if (tcpOk && udpOk) { out(`firewall: TCP :${port} + UDP node.exe ya existen`); break; }
+            out(`firewall: solicitando UAC (TCP :${port}${!udpOk ? ' + UDP node.exe' : ''})…`);
+            const ok = await requestFirewallRule(port, { udp: !udpOk });
+            out(ok ? 'firewall: reglas creadas' : 'firewall: no se crearon');
             break;
           }
 
