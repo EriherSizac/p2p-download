@@ -355,7 +355,11 @@ const PAGE_HTML = `<!doctype html>
   #net { flex:1; height:100%; }
   #panel { width:320px; border-left:1px solid #222; padding:16px; overflow-y:auto; background:#13161e; }
   #panel.hidden { display:none; }
-  #panel h2 { margin:0 0 4px; font-size:14px; font-family: ui-monospace, monospace; word-break:break-all; }
+  #panel h2 { margin:0 0 4px; font-size:14px; font-family: ui-monospace, monospace; word-break:break-all; display:flex; align-items:flex-start; gap:6px; }
+  #panel h2 .copy { background:#1f242e; border:1px solid #2d343f; color:#cfd6e1; padding:2px 6px; border-radius:3px; cursor:pointer; font-size:11px; font-family:inherit; flex-shrink:0; }
+  #panel h2 .copy:hover { background:#2a313d; }
+  #panel h2 .copy.ok { background:#27ae60; border-color:#27ae60; color:#fff; }
+  #panel .self-note { background:#1a2230; border:1px solid #2d3a4f; color:#8fa9d4; padding:8px 10px; border-radius:4px; font-size:12px; margin-bottom:12px; }
   #panel .meta { font-size:11px; color:#8a8f99; margin-bottom:14px; }
   #panel .meta .kv { display:flex; justify-content:space-between; margin-top:3px; }
   #panel .meta .kv span:last-child { font-family: ui-monospace, monospace; color:#cfd6e1; }
@@ -402,9 +406,13 @@ const PAGE_HTML = `<!doctype html>
     <div id="net"></div>
     <aside id="panel" class="hidden">
       <span class="close" onclick="window.__hidePanel()">×</span>
-      <h2 id="p-title">—</h2>
+      <h2 id="p-title"><span id="p-id" style="flex:1; word-break:break-all">—</span><button class="copy" onclick="window.__copyPeerId()">📋 copiar</button></h2>
       <div class="meta" id="p-meta"></div>
-      <div class="actions">
+      <div id="self-note" class="self-note" style="display:none">
+        este es <strong>tu</strong> peerId. No puedes mandarte cosas a ti mismo —
+        compártelo con otra persona para que te localice.
+      </div>
+      <div class="actions" id="p-actions">
         <button class="primary" onclick="window.__sendDm()">enviar DM</button>
         <button onclick="window.__sendWhisper()">🤫 whisper</button>
         <button onclick="window.__sendPing()">⚡ ping</button>
@@ -439,10 +447,12 @@ const PAGE_HTML = `<!doctype html>
   const statusTextEl = document.getElementById('status-text');
   const statsEl      = document.getElementById('stats');
   const panelEl      = document.getElementById('panel');
-  const pTitle       = document.getElementById('p-title');
+  const pIdEl        = document.getElementById('p-id');
   const pMeta        = document.getElementById('p-meta');
   const pText        = document.getElementById('p-text');
   const pRecent      = document.getElementById('p-recent');
+  const pActions     = document.getElementById('p-actions');
+  const pSelfNote    = document.getElementById('self-note');
   const toastContainer = document.getElementById('toast-container');
 
   // Color/tamaño original por nodo, para restaurar después de highlight.
@@ -494,7 +504,7 @@ const PAGE_HTML = `<!doctype html>
   async function refreshPanel(peerId) {
     selectedPeer = peerId;
     panelEl.classList.remove('hidden');
-    pTitle.textContent = peerId;
+    pIdEl.textContent = peerId;
     try {
       const r = await fetch('/api/peer/' + encodeURIComponent(peerId));
       const j = await r.json();
@@ -506,6 +516,12 @@ const PAGE_HTML = `<!doctype html>
         '<div class="kv"><span>RTT</span><span>' + rtt + '</span></div>' +
         '<div class="kv"><span>tú</span><span>' + (info.isMe ? 'sí' : 'no') + '</span></div>' +
         '<div class="kv"><span>sin leer</span><span>' + info.unread + '</span></div>';
+      // No tiene sentido mandarte cosas a ti mismo: ocultar acciones + textarea
+      // y enseñar la nota explicativa. El botón "copiar" sigue visible para
+      // que puedas compartir tu peerId con otros.
+      pSelfNote.style.display = info.isMe ? '' : 'none';
+      pActions.style.display  = info.isMe ? 'none' : '';
+      pText.style.display     = info.isMe ? 'none' : '';
       // Marcar como leídos al abrir el panel.
       if (info.unread > 0) fetch('/api/read/' + encodeURIComponent(peerId), { method: 'POST' });
       // Recientes
@@ -542,6 +558,24 @@ const PAGE_HTML = `<!doctype html>
 
   // ── Acciones expuestas a botones ──────────────────────────────────
   window.__hidePanel = () => { panelEl.classList.add('hidden'); selectedPeer = null; };
+  window.__copyPeerId = async () => {
+    if (!selectedPeer) return;
+    const btn = document.querySelector('#p-title .copy');
+    try {
+      // Clipboard API solo funciona en contextos seguros (https o localhost).
+      // 127.0.0.1 cuenta como localhost → debería ir bien aquí.
+      await navigator.clipboard.writeText(selectedPeer);
+      if (btn) { btn.textContent = '✓ copiado'; btn.classList.add('ok'); setTimeout(() => { btn.textContent = '📋 copiar'; btn.classList.remove('ok'); }, 1500); }
+    } catch (err) {
+      // Fallback: select + execCommand (legacy pero universal).
+      const ta = document.createElement('textarea');
+      ta.value = selectedPeer;
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); showToast('peerId copiado'); }
+      catch { showToast('no se pudo copiar — selecciona manualmente'); }
+      ta.remove();
+    }
+  };
   window.__sendDm = async () => {
     if (!selectedPeer) return;
     const text = pText.value.trim();

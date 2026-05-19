@@ -207,7 +207,10 @@ function buildReceiverSdp(localPort: number): string {
 }
 
 export class AudioReceiver {
-  private bridge?: dgram.Socket;
+  /** Socket que ENVÍA paquetes a ffplay. Bound a un puerto efímero local
+   *  que NO es el que ffplay escucha — son sockets distintos. */
+  private sender?: dgram.Socket;
+  /** Puerto en el que ffplay escucha (escrito en el SDP). */
   private bridgePort = 0;
   private ffplay?: ChildProcess;
   private sdpPath?: string;
@@ -217,43 +220,48 @@ export class AudioReceiver {
   packets = 0;
 
   /**
-   * Abre el bridge UDP y lanza ffplay leyendo desde él. A partir de aquí,
-   * cada `feed(buf)` reenvía un paquete RTP a ffplay.
+   * Reserva un puerto local libre para ffplay, escribe el SDP apuntando a
+   * ese puerto, lanza ffplay (que hará `bind()` sobre él), y crea un
+   * socket sender en OTRO puerto efímero para reenviarle paquetes RTP.
+   *
+   * Importante: nuestro socket NUNCA bindea al puerto del SDP. Ese es
+   * exclusivo de ffplay. Si los compartiéramos, ffplay no recibiría nada
+   * (UDP sin REUSEPORT no permite dos `bind()` simultáneos al mismo puerto).
    */
   async start(callId: string): Promise<void> {
-    await this.openBridge();
+    this.bridgePort = await reserveFreePort();
     this.writeSdpFile(callId);
     this.spawnFfplay();
+    await this.openSender();
   }
 
   /** Inyecta un paquete RTP (ya descifrado por werift) hacia ffplay. */
   feed(rtp: Buffer): void {
     this.bytes += rtp.length;
     this.packets++;
-    this.bridge?.send(rtp, this.bridgePort, '127.0.0.1');
+    this.sender?.send(rtp, this.bridgePort, '127.0.0.1');
   }
 
   stop(): void {
     try { this.ffplay?.kill('SIGTERM'); } catch { /* ignore */ }
-    try { this.bridge?.close(); } catch { /* ignore */ }
+    try { this.sender?.close(); } catch { /* ignore */ }
     if (this.sdpPath) {
       try { unlinkSync(this.sdpPath); } catch { /* ignore */ }
     }
     this.ffplay = undefined;
-    this.bridge = undefined;
+    this.sender = undefined;
     this.sdpPath = undefined;
   }
 
   // --- internos ---
 
-  private async openBridge(): Promise<void> {
-    this.bridge = dgram.createSocket('udp4');
+  private async openSender(): Promise<void> {
+    // bind(0) → SO nos da puerto efímero. Solo lo usamos para .send() —
+    // nunca recibimos por aquí.
+    this.sender = dgram.createSocket('udp4');
     await new Promise<void>((resolve, reject) => {
-      this.bridge!.once('error', reject);
-      this.bridge!.bind(0, '127.0.0.1', () => {
-        this.bridgePort = this.bridge!.address().port;
-        resolve();
-      });
+      this.sender!.once('error', reject);
+      this.sender!.bind(0, '127.0.0.1', () => resolve());
     });
   }
 
@@ -263,6 +271,7 @@ export class AudioReceiver {
     writeFileSync(this.sdpPath, buildReceiverSdp(this.bridgePort), 'utf8');
   }
 
+  // (definición de spawnFfplay justo debajo)
   private spawnFfplay(): void {
     // Cada flag y su porqué:
     //   -protocol_whitelist file,rtp,udp → ffmpeg restringe protocolos por
@@ -303,4 +312,23 @@ export class AudioReceiver {
     });
     this.ffplay.on('exit', (code) => log.info(`[ffplay] exit code=${code}`));
   }
+}
+
+/**
+ * Reserva un puerto UDP local libre: bindea temporalmente, lee el número
+ * que asignó el SO, cierra el socket, devuelve el puerto.
+ *
+ * Race minúscula: entre `close()` y el bind de ffplay, otro proceso podría
+ * llevarse el puerto. En 127.0.0.1 con asignación efímera del SO es muy
+ * improbable. Aceptamos el riesgo a cambio de simplicidad.
+ */
+function reserveFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const s = dgram.createSocket('udp4');
+    s.once('error', reject);
+    s.bind(0, '127.0.0.1', () => {
+      const port = s.address().port;
+      s.close(() => resolve(port));
+    });
+  });
 }

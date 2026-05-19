@@ -1,2 +1,4 @@
 {"ts":1779217912859,"dir":"out","peerId":"broadcast","messageId":"65b1e745a2790de2","text":"hello"}
 {"ts":1779217921927,"dir":"in","peerId":"e257fb081a856187531ce85d51261c39cbd8f03a463ea74db36b00111a9f7aa0","messageId":"0f97de4f44bd2ded","text":"gello"}
+{"ts":1779222095634,"dir":"in","peerId":"16174ad7b58852135c4482ee2b004625e60cebc14d2aef58cd4ee5ad6ed772a0","messageId":"0fc74ea34a0568d0","text":"hola"}
+{"ts":1779222202600,"dir":"in","peerId":"16174ad7b58852135c4482ee2b004625e60cebc14d2aef58cd4ee5ad6ed772a0","messageId":"c32061f1f1d7f13c","text":"aaa"}
