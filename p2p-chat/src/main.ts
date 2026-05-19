@@ -63,6 +63,9 @@ interface PeerLiveness {
   pendingPings: Map<number, number>;
 }
 
+/** Cuánto tiempo entre gossips de PEER_LIST (s). Bajo = grafo más fresco. */
+const PEER_LIST_INTERVAL_MS = 15_000;
+
 /**
  * Prompt sí/no en stdin sin readline persistente. Lo usamos antes de
  * arrancar la CLI principal para no chocar con su propio readline.
@@ -131,9 +134,26 @@ async function bootstrap(): Promise<void> {
   const pendingAcks = new Map<string, PendingAck>();
   const liveness = new Map<string, PeerLiveness>();
 
+  // Gossip de topología: lo que CADA peer remoto nos dice que conoce.
+  // Clave = peerId del informante. Valor = peerIds que él conoce
+  // (sus conexiones activas + nosotros). Con esto reconstruimos el grafo
+  // global aunque solo estemos conectados directamente a un subconjunto.
+  const peerLists = new Map<string, { peers: string[]; ts: number }>();
+
   // Estado de llamadas activas. Solo una concurrente por peer remoto (simple).
   const calls = new Map<string, Call>(); // callId → Call
   const callsByPeer = new Map<string, string>(); // peerId → callId
+
+  // Envía nuestra lista de conectados al peer dado.
+  const sendPeerList = (to: string): void => {
+    transport.send(to, { type: MSG.PEER_LIST, peers: transport.connectedPeers() });
+  };
+
+  // En cuanto un peer entra al pool, mandamos PEER_LIST inicial — así el
+  // grafo no espera al primer tick del timer.
+  transport.on('peer-connected', (pid) => sendPeerList(pid));
+
+  transport.on('peer-disconnected', (pid) => peerLists.delete(pid));
 
   // ---------------------------------------------------------------------
   // Manejo de mensajes entrantes.
@@ -255,6 +275,15 @@ async function bootstrap(): Promise<void> {
         break;
       }
 
+      case MSG.PEER_LIST: {
+        // Gossip de topología. El emisor nos manda los peers que él tiene
+        // conectados; lo guardamos con timestamp para que `graph` pinte el
+        // estado actual. No reenviamos (un solo hop) — el destinatario debe
+        // pedir su propio gossip a sus vecinos para componer la vista completa.
+        peerLists.set(from, { peers: msg.peers, ts: Date.now() });
+        break;
+      }
+
       case MSG.CALL_OFFER: {
         // Política simple: una sola llamada concurrente por peer remoto.
         // Si ya estamos hablando con ese peer, devolvemos CALL_END(busy).
@@ -338,6 +367,12 @@ async function bootstrap(): Promise<void> {
     }
   }, PING_INTERVAL_MS);
 
+  // Timer de gossip PEER_LIST. Lo separamos del PING para que la frecuencia
+  // pueda ser distinta: PING es liveness fina (5s); el grafo cambia menos.
+  const peerListTimer = setInterval(() => {
+    for (const pid of transport.connectedPeers()) sendPeerList(pid);
+  }, PEER_LIST_INTERVAL_MS);
+
   // ---------------------------------------------------------------------
   // Helper de llamadas: monta el cableado entre Call y transport.
   // ---------------------------------------------------------------------
@@ -384,7 +419,7 @@ async function bootstrap(): Promise<void> {
     transport,
     peerId,
     sinks: cliSinks,
-    state: { pendingAcks, liveness, calls, callsByPeer },
+    state: { pendingAcks, liveness, calls, callsByPeer, peerLists },
     pending: {
       get incomingOffer() { return pendingIncomingOffer; },
       clear() { pendingIncomingOffer = undefined; },
@@ -395,6 +430,7 @@ async function bootstrap(): Promise<void> {
   const shutdown = (): void => {
     log.info('cerrando…');
     clearInterval(pingTimer);
+    clearInterval(peerListTimer);
     for (const call of calls.values()) void call.closeFromRemote('shutdown');
     transport.broadcast({ type: MSG.BYE });
     discovery.stop();
@@ -419,6 +455,7 @@ interface CliCtx {
     liveness: Map<string, PeerLiveness>;
     calls: Map<string, Call>;
     callsByPeer: Map<string, string>;
+    peerLists: Map<string, { peers: string[]; ts: number }>;
   };
   pending: {
     readonly incomingOffer: { callId: string; from: string; sdp: string } | undefined;
@@ -450,6 +487,7 @@ function setupCli(ctx: CliCtx): void {
     out('  │  history [n]              últimos n mensajes (default 20)│');
     out('  │  peers                    peers descubiertos + RTT       │');
     out('  │  who                      peers conectados + RTT         │');
+    out('  │  graph                    grafo de conectividad de la red│');
     out('  │  call <peerId> [source]   llamar (source=tone|mic|file:…)│');
     out('  │  answer                   aceptar llamada entrante       │');
     out('  │  hangup                   colgar llamada activa          │');
@@ -611,6 +649,11 @@ function setupCli(ctx: CliCtx): void {
             break;
           }
 
+          case 'graph': {
+            renderGraph(out, ctx);
+            break;
+          }
+
           case 'firewall': {
             if (!fwSupported()) { out('firewall: solo Windows'); break; }
             const port = ctx.transport.port();
@@ -647,7 +690,7 @@ function setupCli(ctx: CliCtx): void {
             process.kill(process.pid, 'SIGINT');
             return;
           case 'help':
-            out('comandos: peers | who | chat <texto> | msg <peerId> <texto> | history [n] | call <peerId> [source] | answer | hangup | firewall | menu | quit');
+            out('comandos: peers | who | graph | chat <texto> | msg <peerId> <texto> | history [n] | call <peerId> [source] | answer | hangup | firewall | menu | quit');
             break;
           default:
             out(`comando desconocido: ${cmd}`);
@@ -658,6 +701,83 @@ function setupCli(ctx: CliCtx): void {
       rl.prompt();
     })();
   });
+}
+
+/**
+ * Renderiza el grafo de conectividad de la red en ASCII.
+ *
+ * Datos disponibles:
+ *   - Nosotros (`ctx.peerId`) → conocemos a `transport.connectedPeers()`.
+ *   - Cada peer `X` conectado nos ha mandado un `PEER_LIST` con SUS vecinos
+ *     (almacenado en `ctx.state.peerLists`).
+ *
+ * Construimos la unión: nodos = todos los peerIds que aparecen en cualquier
+ * lista + nosotros. Aristas dirigidas A→B significa "A dice conocer a B".
+ * Si A→B y B→A existen, la conexión es mutua (más sólida).
+ *
+ * Render: dos secciones.
+ *   1) Adyacencia por peer (lista A → [vecinos]).
+ *   2) Resumen de aristas mutuas vs unidireccionales + densidad.
+ */
+function renderGraph(out: (s: string) => void, ctx: CliCtx): void {
+  const me = ctx.peerId;
+  const myNeighbors = new Set(ctx.transport.connectedPeers());
+
+  // Adjacency: peerId → Set de a quién dice conocer.
+  const adj = new Map<string, Set<string>>();
+  adj.set(me, new Set(myNeighbors));
+  for (const [pid, info] of ctx.state.peerLists) {
+    adj.set(pid, new Set(info.peers));
+  }
+
+  // Conjunto total de nodos: todo lo que aparece como origen o destino.
+  const nodes = new Set<string>(adj.keys());
+  for (const targets of adj.values()) for (const t of targets) nodes.add(t);
+
+  if (nodes.size <= 1) { out('(sin peers conocidos)'); return; }
+
+  out('');
+  out('  ┌─ grafo de conectividad ──────────────────────────────────┐');
+
+  // Sección 1: adyacencia. Para cada nodo, su lista de vecinos vistos.
+  // Marcamos con "==" las aristas mutuas y "->" las unidireccionales (gossip
+  // aún no recibido en sentido inverso, o peer no nos ha hablado todavía).
+  const sortedNodes = [...nodes].sort();
+  for (const a of sortedNodes) {
+    const label = shortId(a) + (a === me ? ' (tú)' : '');
+    const targets = [...(adj.get(a) ?? [])].sort();
+    if (targets.length === 0) {
+      out(`  ${label}  →  (sin vecinos conocidos)`);
+      continue;
+    }
+    const parts = targets.map((b) => {
+      const mutual = adj.get(b)?.has(a) ?? false;
+      const arrow = mutual ? '==' : '→';
+      return `${arrow} ${shortId(b)}${b === me ? '(tú)' : ''}`;
+    });
+    out(`  ${label}  ${parts.join('  ')}`);
+  }
+
+  // Sección 2: métricas de red.
+  let mutual = 0;
+  let oneway = 0;
+  const seen = new Set<string>();
+  for (const [a, targets] of adj) {
+    for (const b of targets) {
+      const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const reverse = adj.get(b)?.has(a) ?? false;
+      if (reverse) mutual++; else oneway++;
+    }
+  }
+  const n = nodes.size;
+  const maxEdges = (n * (n - 1)) / 2;
+  const density = maxEdges > 0 ? (mutual / maxEdges).toFixed(2) : '0.00';
+  out('  ─────────────────────────────────────────────────────────');
+  out(`  nodos=${n}  aristas mutuas=${mutual}  unidireccionales=${oneway}  densidad=${density}`);
+  out('  leyenda: ==  conexión mutua    →  un solo sentido (gossip parcial)');
+  out('  └──────────────────────────────────────────────────────────┘');
 }
 
 bootstrap().catch((err) => {

@@ -46,6 +46,11 @@ export const MSG = {
   /** Respuesta al PING; el emisor calcula RTT = ahora - ts del nonce. */
   PONG: 0x06,
 
+  // ── Gossip de topología (0x07) ────────────────────────────────────────
+  /** Anuncia qué peers conoce el emisor. Se usa para reconstruir el
+   *  grafo global de conectividad (comando `graph`). */
+  PEER_LIST: 0x07,
+
   // ── Señalización WebRTC (0x10–0x13) ───────────────────────────────────
   // Ojo: SOLO viaja por aquí la SDP y los candidatos ICE. El audio real
   // va por SRTP/UDP fuera de este protocolo (ver src/call.ts).
@@ -78,6 +83,7 @@ export type Message =
   | { type: typeof MSG.BYE }
   | { type: typeof MSG.PING; nonce: number }
   | { type: typeof MSG.PONG; nonce: number }
+  | { type: typeof MSG.PEER_LIST; peers: string[] }
   | { type: typeof MSG.CALL_OFFER; callId: string; sdp: string }
   | { type: typeof MSG.CALL_ANSWER; callId: string; sdp: string }
   | { type: typeof MSG.CALL_ICE; callId: string; candidate: IceCandidatePayload | null }
@@ -124,6 +130,7 @@ export function decode(buf: Buffer): Message {
     case MSG.CHAT_ACK:
     case MSG.PING:
     case MSG.PONG:
+    case MSG.PEER_LIST:
     case MSG.CALL_OFFER:
     case MSG.CALL_ANSWER:
     case MSG.CALL_ICE:

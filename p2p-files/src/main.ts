@@ -23,6 +23,7 @@ import {
 import { createLogger } from './logger.js';
 import { FileIndex } from './index-files.js';
 import { Scheduler } from './scheduler.js';
+import { isSupported as fwSupported, ruleExistsForPort, requestFirewallRule } from './firewall.js';
 
 const log = createLogger('main');
 
@@ -38,6 +39,20 @@ interface PendingResolver<T> {
   timer: NodeJS.Timeout;
 }
 
+/**
+ * Prompt sí/no en stdin sin readline persistente. Lo usamos antes de
+ * arrancar la CLI principal para no chocar con su propio readline.
+ */
+function askYesNo(question: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (ans) => {
+      rl.close();
+      resolve(/^y(es)?$/i.test(ans.trim()));
+    });
+  });
+}
+
 async function bootstrap(): Promise<void> {
   const peerId = generatePeerId();
   log.info(`peerId = ${shortId(peerId)} (full=${peerId})`);
@@ -47,6 +62,27 @@ async function bootstrap(): Promise<void> {
 
   const transport = new Transport({ peerId, tcpPort: TCP_PORT });
   const actualPort = await transport.start();
+
+  // Firewall (solo Windows): si no hay regla inbound TCP para nuestro puerto,
+  // ofrecer crearla con UAC ANTES de arrancar discovery. Evita que el primer
+  // round de peers nos conecte por TCP y muera por ETIMEDOUT.
+  if (fwSupported()) {
+    const tcpOk = await ruleExistsForPort(actualPort);
+    if (!tcpOk) {
+      const yes = await askYesNo(
+        `firewall: no hay regla inbound TCP para :${actualPort}. ¿Crearla? (pedirá UAC) [y/N] `,
+      );
+      if (yes) {
+        log.info('solicitando elevación…');
+        const created = await requestFirewallRule(actualPort);
+        log.info(created ? `regla creada para :${actualPort}` : 'no se creó (UAC denegado o error)');
+      } else {
+        log.warn('firewall sin abrir; peers remotos quizá no puedan conectar.');
+      }
+    } else {
+      log.debug(`firewall: regla para :${actualPort} ya existe`);
+    }
+  }
 
   const discovery = new Discovery({ peerId, tcpPort: actualPort, discoveryPort: DISCOVERY_PORT });
   await discovery.start();
