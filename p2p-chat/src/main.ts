@@ -461,6 +461,7 @@ async function bootstrap(): Promise<void> {
           ? rtt
           : RTT_EWMA_ALPHA * rtt + (1 - RTT_EWMA_ALPHA) * liv.rttMs;
         if (msg.manual) {
+          cliSinks.info?.(`🏓 pong de ${shortId(from)}  RTT=${rtt} ms`);
           graphServer?.pingPulse(from, peerId, 'pong');
           pushSnapshot(); // actualiza tooltip RTT
         }
