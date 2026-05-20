@@ -324,7 +324,7 @@ export class GraphServer {
     // Mandar último snapshot conocido para que la página no arranque vacía.
     if (this.lastSnap) {
       try {
-        res.write(`data: ${JSON.stringify(this.lastSnap)}\n\n`);
+        res.write(`data: ${JSON.stringify({ kind: 'snapshot', ...this.lastSnap })}\n\n`);
       } catch {
         /* ignore */
       }
