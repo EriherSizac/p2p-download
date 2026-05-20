@@ -11,10 +11,12 @@
 .PARAMETER DiscoveryPort  Puerto UDP de descubrimiento (default 41249)
 .PARAMETER MaxPeers       MAX_PEERS por peer (default 3)
 .PARAMETER SearchTTL      SEARCH_TTL por peer (default 7)
+.PARAMETER Visible        Muestra ventanas cmd (debug)
 
 .EXAMPLE
   .\spawn-peers.ps1
   .\spawn-peers.ps1 -Count 5 -MaxPeers 2
+  .\spawn-peers.ps1 -Count 3 -Visible
 #>
 param(
   [int]$Count         = 10,
@@ -22,13 +24,14 @@ param(
   [int]$DiscoveryPort = 41249,
   [int]$MaxPeers      = 3,
   [int]$SearchTTL     = 7,
-  [switch]$FirewallOnly   # interno: solo crear reglas y salir
+  [switch]$Visible,
+  [switch]$FirewallOnly
 )
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-# ── 1. Detectar reglas faltantes (lectura sin admin) ─────────────────────────
+# === 1. Detectar reglas faltantes (lectura sin admin) =========================
 
 function Get-MissingRules([int]$base, [int]$cnt, [int]$discPort) {
   $missing = [System.Collections.Generic.List[string]]::new()
@@ -46,7 +49,7 @@ function Get-MissingRules([int]$base, [int]$cnt, [int]$discPort) {
 
 $missing = Get-MissingRules -base $BasePort -cnt $Count -discPort $DiscoveryPort
 
-# ── 2. Crear reglas si faltan (una sola vez con UAC) ─────────────────────────
+# === 2. Crear reglas si faltan (una sola vez con UAC) =========================
 
 function New-SwarmRules([int]$base, [int]$cnt, [int]$discPort) {
   Write-Host "=== Firewall (reglas permanentes) ===" -ForegroundColor Cyan
@@ -69,20 +72,18 @@ function New-SwarmRules([int]$base, [int]$cnt, [int]$discPort) {
   } else {
     Write-Host "  [=] UDP :$discPort  (ya existe)"
   }
-  Write-Host "  Reglas guardadas — proximas ejecuciones no necesitan admin." -ForegroundColor Green
+  Write-Host "  Reglas guardadas - proximas ejecuciones no necesitan admin." -ForegroundColor Green
 }
 
 if ($missing.Count -gt 0) {
   if (-not $isAdmin) {
-    # Primera vez: elevar solo para crear reglas, luego continuar sin admin
-    Write-Host "[!] Primer uso — elevando para crear $($missing.Count) regla(s) de firewall..." `
+    Write-Host "[!] Primer uso - elevando para crear $($missing.Count) regla(s) de firewall..." `
       -ForegroundColor Yellow
     $elevArgs = "-ExecutionPolicy Bypass -File `"$PSCommandPath`"" +
                 " -Count $Count -BasePort $BasePort -DiscoveryPort $DiscoveryPort" +
                 " -MaxPeers $MaxPeers -SearchTTL $SearchTTL -FirewallOnly"
     Start-Process powershell -Verb RunAs -Wait -ArgumentList $elevArgs
 
-    # Re-verificar despues de la elevacion
     $missing = Get-MissingRules -base $BasePort -cnt $Count -discPort $DiscoveryPort
     if ($missing.Count -gt 0) {
       Write-Host "[!] Reglas aun faltantes: $($missing -join ', ')" -ForegroundColor Red
@@ -97,7 +98,7 @@ if ($missing.Count -gt 0) {
 
 if ($FirewallOnly) { exit 0 }
 
-# ── 3. Lanzar peers ───────────────────────────────────────────────────────────
+# === 3. Lanzar peers ==========================================================
 
 $root      = Split-Path $PSCommandPath -Parent
 $processes = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
@@ -116,10 +117,14 @@ for ($i = 0; $i -lt $Count; $i++) {
   $envBlock = "set TCP_PORT=$port && set DISCOVERY_PORT=$DiscoveryPort && " +
               "set MAX_PEERS=$MaxPeers && set SEARCH_TTL=$SearchTTL"
 
+  # `echo n | ...` auto-declina prompts interactivos del main.ts (firewall, etc.)
+  # En -Visible usamos /k para que la ventana no se cierre al fallar tsx.
+  $cmdFlag  = if ($Visible) { '/k' } else { '/c' }
+  $winStyle = if ($Visible) { 'Normal' } else { 'Hidden' }
   $p = Start-Process "cmd.exe" `
-    -ArgumentList "/c $envBlock && npx tsx src\main.ts" `
+    -ArgumentList "$cmdFlag $envBlock && echo n | npx tsx src\main.ts" `
     -WorkingDirectory $root `
-    -WindowStyle Hidden `
+    -WindowStyle $winStyle `
     -PassThru
 
   $processes.Add($p)
@@ -130,7 +135,7 @@ Write-Host ""
 Write-Host "$Count peers activos. Ctrl+C para matar todos." -ForegroundColor Green
 Write-Host "(proximas ejecuciones no pediran admin)" -ForegroundColor DarkGray
 
-# ── 4. Cleanup al salir ───────────────────────────────────────────────────────
+# === 4. Cleanup al salir ======================================================
 
 function Stop-AllPeers {
   Write-Host ""
