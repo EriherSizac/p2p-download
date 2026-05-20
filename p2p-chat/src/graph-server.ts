@@ -1,3 +1,8 @@
+// File: GRAPH SERVER — visualizador en vivo del grafo de peers.
+// Created: 2026-05-19
+// Updated: 2026-05-19
+// Author: Erick Hernández Silva
+
 /**
  * GRAPH SERVER — visualizador en vivo del grafo de peers.
  *
@@ -43,6 +48,7 @@ export interface GraphActions {
     isConnected: boolean;
     recent: Array<{ ts: number; dir: 'in' | 'out'; text: string }>;
     unread: number;
+    history: Array<{ ts: number; kind: 'connected' | 'disconnected' }>;
   };
   /** Marca mensajes con peer como leídos (badge a cero). */
   markRead(peerId: string): void;
@@ -52,7 +58,8 @@ export interface GraphActions {
 export type GraphEvent =
   | ({ kind: 'snapshot' } & GraphSnapshot)
   | { kind: 'highlight'; peerId: string; label?: string; color?: string }
-  | { kind: 'toast'; text: string };
+  | { kind: 'toast'; text: string }
+  | { kind: 'ping-pulse'; from: string; to: string; phase: 'ping' | 'pong' };
 
 /** Forma del snapshot que mandamos al navegador. */
 export interface GraphSnapshot {
@@ -121,6 +128,11 @@ export class GraphServer {
   /** Empuja un toast informativo (esquina del HTML). */
   toast(text: string): void {
     this.broadcast({ kind: 'toast', text });
+  }
+
+  /** Anima el arco entre dos peers para visualizar PING → PONG. */
+  pingPulse(from: string, to: string, phase: 'ping' | 'pong'): void {
+    this.broadcast({ kind: 'ping-pulse', from, to, phase });
   }
 
   private broadcast(ev: GraphEvent): void {
@@ -466,19 +478,39 @@ const PAGE_HTML = `<!doctype html>
   }
 
   function applySnapshot(snap) {
-    const newNodeIds = new Set(snap.nodes.map(n => n.id));
-    const newEdgeIds = new Set(snap.edges.map(e => e.id));
-    for (const id of nodes.getIds()) if (!newNodeIds.has(id)) { nodes.remove(id); originalAttrs.delete(id); }
-    for (const id of edges.getIds()) if (!newEdgeIds.has(id)) edges.remove(id);
-    nodes.update(snap.nodes);
+    const prevNodeIds = new Set(nodes.getIds());
+    const prevEdgeIds = new Set(edges.getIds());
+    const newNodeIds  = new Set(snap.nodes.map(n => n.id));
+    const newEdgeIds  = new Set(snap.edges.map(e => e.id));
+
+    for (const id of prevNodeIds) if (!newNodeIds.has(id)) { nodes.remove(id); originalAttrs.delete(id); }
+    for (const id of prevEdgeIds) if (!newEdgeIds.has(id)) edges.remove(id);
+
+    // Nuevos nodos: pop-in arrancando con tamaño mínimo → vis-network anima la expansión.
+    const arriving = snap.nodes.filter(n => !prevNodeIds.has(n.id));
+    if (arriving.length) {
+      nodes.update(arriving.map(n => ({ ...n, size: 3 })));
+      setTimeout(() => nodes.update(arriving.map(n => ({ id: n.id, size: n.size }))), 120);
+    }
+    // Nodos existentes: actualizar normalmente.
+    nodes.update(snap.nodes.filter(n => prevNodeIds.has(n.id)));
+
+    // Nuevos arcos: flash de color al aparecer.
+    const arrivingEdges = snap.edges.filter(e => !prevEdgeIds.has(e.id));
     edges.update(snap.edges);
-    // Refrescar copia de atributos originales para nodos nuevos/cambiados.
+    if (arrivingEdges.length) {
+      setTimeout(() => {
+        edges.update(arrivingEdges.map(e => ({ id: e.id, color: { color: '#f1c40f' }, width: (e.width || 1) + 3 })));
+        setTimeout(() => edges.update(arrivingEdges.map(e => ({ id: e.id, color: e.color, width: e.width }))), 700);
+      }, 200);
+    }
+
     for (const n of snap.nodes) originalAttrs.set(n.id, { color: n.color, size: n.size });
 
     const s = snap.stats;
     const when = new Date(snap.ts).toLocaleTimeString();
     statsEl.textContent = 'nodos=' + s.total + ' · mutuas=' + s.mutuals + ' · un sentido=' + s.oneway + ' · densidad=' + s.density + '  ·  actualizado ' + when;
-    if (selectedPeer) refreshPanel(selectedPeer); // mantener panel sincronizado
+    if (selectedPeer) refreshPanel(selectedPeer);
   }
 
   function applyHighlight(ev) {
@@ -491,6 +523,27 @@ const PAGE_HTML = `<!doctype html>
       const cur = nodes.get(ev.peerId);
       if (cur) nodes.update({ id: ev.peerId, color: orig.color, size: orig.size });
     }, 1200);
+  }
+
+  function applyPingPulse(ev) {
+    // Buscar arco entre los dos peers (key siempre menor|mayor).
+    const edgeId = ev.from < ev.to ? ev.from + '|' + ev.to : ev.to + '|' + ev.from;
+    const edge = edges.get(edgeId);
+    const color = ev.phase === 'ping' ? '#f39c12' : '#2ecc71'; // naranja=ping, verde=pong
+    if (edge) {
+      const origColor = edge.color;
+      const origWidth = edge.width || 1;
+      edges.update({ id: edgeId, color: { color }, width: origWidth + 4 });
+      setTimeout(() => edges.update({ id: edgeId, color: origColor, width: origWidth }), 500);
+    } else {
+      // Sin arco directo: pulsar el nodo destino.
+      const targetId = ev.phase === 'ping' ? ev.to : ev.from;
+      const orig = originalAttrs.get(targetId);
+      if (orig) {
+        nodes.update({ id: targetId, color: { background: color, border: color }, size: orig.size + 8 });
+        setTimeout(() => nodes.update({ id: targetId, color: orig.color, size: orig.size }), 500);
+      }
+    }
   }
 
   function showToast(text) {
@@ -524,6 +577,15 @@ const PAGE_HTML = `<!doctype html>
       pText.style.display     = info.isMe ? 'none' : '';
       // Marcar como leídos al abrir el panel.
       if (info.unread > 0) fetch('/api/read/' + encodeURIComponent(peerId), { method: 'POST' });
+      // Historial de conexiones (últimas 5, más reciente primero).
+      if (info.history && info.history.length) {
+        const histHtml = info.history.slice(-5).reverse().map(h => {
+          const icon = h.kind === 'connected' ? '\u{1F7E2}' : '\u{1F534}';
+          const t = new Date(h.ts).toLocaleTimeString().replace(/[&<>"']/g, '');
+          return icon + ' ' + t;
+        }).join(' · ');
+        pMeta.innerHTML += '<div class="kv" style="margin-top:6px"><span>historial</span><span>' + histHtml + '</span></div>';
+      }
       // Recientes
       pRecent.innerHTML = info.recent.length === 0
         ? '<div style="color:#6b7280;font-size:12px">(sin mensajes)</div>'
@@ -621,6 +683,7 @@ const PAGE_HTML = `<!doctype html>
       if (data.kind === 'snapshot') applySnapshot(data);
       else if (data.kind === 'highlight') applyHighlight(data);
       else if (data.kind === 'toast') showToast(data.text);
+      else if (data.kind === 'ping-pulse') applyPingPulse(data);
     } catch (err) {
       console.error('evento inválido', err);
     }

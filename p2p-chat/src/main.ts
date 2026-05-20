@@ -1,6 +1,6 @@
 // File: MAIN — orquestación de capas + CLI (chat + llamadas)
 // Created: 2026-05-13
-// Updated: 2026-05-13
+// Updated: 2026-05-19
 // Author: Erick Hernández Silva
 
 /**
@@ -143,6 +143,16 @@ async function bootstrap(): Promise<void> {
   // Gossip de topología: lo que CADA peer remoto nos dice que conoce.
   const peerLists = new Map<string, { peers: string[]; ts: number }>();
 
+  // Historial de conexiones por peer (últimas N entradas).
+  const CONN_HIST_CAP = 20;
+  const connHistory = new Map<string, Array<{ ts: number; kind: 'connected' | 'disconnected' }>>();
+  const pushConnHist = (pid: string, kind: 'connected' | 'disconnected'): void => {
+    let arr = connHistory.get(pid);
+    if (!arr) { arr = []; connHistory.set(pid, arr); }
+    arr.push({ ts: Date.now(), kind });
+    if (arr.length > CONN_HIST_CAP) arr.shift();
+  };
+
   // Historial reciente por peer (capado) — alimenta el panel lateral del
   // grafo en vivo. Va aparte del histAppend (que escribe a disco): aquí
   // solo necesitamos los últimos N en memoria para mostrar al usuario.
@@ -244,9 +254,9 @@ async function bootstrap(): Promise<void> {
     graphServer.emit(buildSnapshot());
   };
 
-  // Cualquier cambio observable en la topología → empujar snapshot.
-  transport.on('peer-connected', pushSnapshot);
-  transport.on('peer-disconnected', pushSnapshot);
+  // Cualquier cambio observable en la topología → empujar snapshot + historial.
+  transport.on('peer-connected', (pid) => { pushConnHist(pid, 'connected'); pushSnapshot(); });
+  transport.on('peer-disconnected', (pid) => { pushConnHist(pid, 'disconnected'); pushSnapshot(); });
 
   /**
    * Arranca (si no está corriendo) el server HTTP del grafo en vivo, manda
@@ -305,6 +315,7 @@ async function bootstrap(): Promise<void> {
           isConnected: transport.isConnected(peerId),
           recent,
           unread: unreadByPeer.get(peerId) ?? 0,
+          history: connHistory.get(peerId) ?? [],
         };
       },
       markRead(peerId) {
@@ -439,6 +450,8 @@ async function bootstrap(): Promise<void> {
         liv.rttMs = liv.rttMs === undefined
           ? rtt
           : RTT_EWMA_ALPHA * rtt + (1 - RTT_EWMA_ALPHA) * liv.rttMs;
+        graphServer?.pingPulse(from, peerId, 'pong');
+        pushSnapshot(); // actualiza tooltip RTT
         break;
       }
 
@@ -532,6 +545,7 @@ async function bootstrap(): Promise<void> {
       const nonce = nextNonce++;
       liv.pendingPings.set(nonce, Date.now());
       transport.send(pid, { type: MSG.PING, nonce });
+      graphServer?.pingPulse(peerId, pid, 'ping');
     }
   }, PING_INTERVAL_MS);
 
