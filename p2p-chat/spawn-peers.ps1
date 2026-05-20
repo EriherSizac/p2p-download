@@ -21,7 +21,7 @@ param(
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-# ── 1. Detectar reglas faltantes (lectura sin admin) ─────────────────────────
+# === 1. Detectar reglas faltantes (lectura sin admin) =========================
 
 function Get-MissingRules([int]$base, [int]$cnt) {
   $missing = [System.Collections.Generic.List[string]]::new()
@@ -36,7 +36,7 @@ function Get-MissingRules([int]$base, [int]$cnt) {
 
 $missing = Get-MissingRules -base $BasePort -cnt $Count
 
-# ── 2. Crear reglas si faltan (una sola vez con UAC) ─────────────────────────
+# === 2. Crear reglas si faltan (una sola vez con UAC) =========================
 
 function New-ChatRules([int]$base, [int]$cnt) {
   Write-Host "=== Firewall (reglas permanentes) ===" -ForegroundColor Cyan
@@ -51,12 +51,12 @@ function New-ChatRules([int]$base, [int]$cnt) {
       Write-Host "  [=] TCP :$p  (ya existe)"
     }
   }
-  Write-Host "  Reglas guardadas — proximas ejecuciones no necesitan admin." -ForegroundColor Green
+  Write-Host "  Reglas guardadas - proximas ejecuciones no necesitan admin." -ForegroundColor Green
 }
 
 if ($missing.Count -gt 0) {
   if (-not $isAdmin) {
-    Write-Host "[!] Primer uso — elevando para crear $($missing.Count) regla(s) de firewall..." `
+    Write-Host "[!] Primer uso - elevando para crear $($missing.Count) regla(s) de firewall..." `
       -ForegroundColor Yellow
     $elevArgs = "-ExecutionPolicy Bypass -File `"$PSCommandPath`"" +
                 " -Count $Count -BasePort $BasePort -FirewallOnly"
@@ -76,7 +76,7 @@ if ($missing.Count -gt 0) {
 
 if ($FirewallOnly) { exit 0 }
 
-# ── 3. Lanzar peers ───────────────────────────────────────────────────────────
+# === 3. Lanzar peers ==========================================================
 
 $root      = Split-Path $PSCommandPath -Parent
 $processes = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
@@ -105,7 +105,7 @@ Write-Host ""
 Write-Host "$Count peers activos. Ctrl+C para matar todos." -ForegroundColor Green
 Write-Host "(proximas ejecuciones no pediran admin)" -ForegroundColor DarkGray
 
-# ── 4. Cleanup al salir ───────────────────────────────────────────────────────
+# === 4. Cleanup al salir ======================================================
 
 function Stop-AllPeers {
   Write-Host ""
