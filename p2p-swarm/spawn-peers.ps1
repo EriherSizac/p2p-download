@@ -19,7 +19,7 @@
   .\spawn-peers.ps1 -Count 3 -Visible
 #>
 param(
-  [int]$Count         = 10,
+  [int]$Count         = 50,
   [int]$BasePort      = 41251,
   [int]$DiscoveryPort = 41249,
   [int]$MaxPeers      = 3,

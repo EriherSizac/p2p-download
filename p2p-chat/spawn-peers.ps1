@@ -13,7 +13,7 @@
   .\spawn-peers.ps1 -Count 5 -BasePort 41240
 #>
 param(
-  [int]$Count    = 10,
+  [int]$Count    = 50,
   [int]$BasePort = 41237,
   [switch]$Visible,        # muestra ventanas cmd (debug: ver logs de peers)
   [switch]$FirewallOnly    # interno: solo crear reglas y salir
