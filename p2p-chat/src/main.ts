@@ -321,6 +321,16 @@ async function bootstrap(): Promise<void> {
       markRead(peerId) {
         unreadByPeer.delete(peerId);
       },
+      sendPing(to) {
+        if (!transport.isConnected(to)) return { ok: false, error: 'sin conexión TCP a ese peer' };
+        let liv = liveness.get(to);
+        if (!liv) { liv = { pendingPings: new Map() }; liveness.set(to, liv); }
+        const nonce = nextNonce++;
+        liv.pendingPings.set(nonce, Date.now());
+        transport.send(to, { type: MSG.PING, nonce });
+        graphServer?.pingPulse(peerId, to, 'ping');
+        return { ok: true };
+      },
     };
   }
   // Tiny helper para evitar declarar `peerId` doble dentro del closure de
@@ -414,9 +424,8 @@ async function bootstrap(): Promise<void> {
       case MSG.PING:
         // Responder con PONG mismo nonce. NO añadimos timestamp aquí: el
         // RTT se mide en el lado que pingó (él sabe cuándo mandó cada nonce).
-      
+        cliSinks.info?.(`⚡ ping de ${shortId(from)} → enviando pong`);
         transport.send(from, { type: MSG.PONG, nonce: msg.nonce });
-        
         break;
 
       case MSG.PONG: {
@@ -545,7 +554,6 @@ async function bootstrap(): Promise<void> {
       const nonce = nextNonce++;
       liv.pendingPings.set(nonce, Date.now());
       transport.send(pid, { type: MSG.PING, nonce });
-      graphServer?.pingPulse(peerId, pid, 'ping');
     }
   }, PING_INTERVAL_MS);
 

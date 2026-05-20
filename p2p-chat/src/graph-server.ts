@@ -52,6 +52,8 @@ export interface GraphActions {
   };
   /** Marca mensajes con peer como leídos (badge a cero). */
   markRead(peerId: string): void;
+  /** Envía un PING de protocolo real y dispara animación en el grafo. */
+  sendPing(toPeerId: string): { ok: boolean; error?: string };
 }
 
 /** Evento push: snapshot completo o highlight puntual (pulso visual). */
@@ -266,15 +268,13 @@ export class GraphServer {
   }
 
   private async handlePing(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    // Ping desde web: pulso visual amarillo. No genera tráfico nuevo (el
-    // protocolo PING/PONG ya corre cada 5s para liveness). Es señal local.
+    if (!this.actions) return this.json(res, 503, { ok: false, error: 'actions not wired' });
     try {
       const body = await this.readJson(req);
       const to = String(body['to'] ?? '');
       if (!to) return this.json(res, 400, { ok: false, error: 'to required' });
-      this.highlight(to, { color: '#f1c40f', label: '⚡ ping' });
-      this.toast(`ping → ${to.slice(0, 8)}`);
-      this.json(res, 200, { ok: true });
+      const r = this.actions.sendPing(to);
+      this.json(res, r.ok ? 200 : 502, r);
     } catch (err) {
       this.json(res, 400, { ok: false, error: (err as Error).message });
     }
@@ -526,23 +526,27 @@ const PAGE_HTML = `<!doctype html>
   }
 
   function applyPingPulse(ev) {
-    // Buscar arco entre los dos peers (key siempre menor|mayor).
+    // naranja=ping enviado, verde=pong recibido
+    const color = ev.phase === 'ping' ? '#e67e22' : '#27ae60';
+    // Nodo que "recibe" el impulso: destino en ping, origen en pong.
+    const targetId = ev.phase === 'ping' ? ev.to : ev.from;
+    const DUR = 800;
+
+    // Pulsar arco (si existe).
     const edgeId = ev.from < ev.to ? ev.from + '|' + ev.to : ev.to + '|' + ev.from;
     const edge = edges.get(edgeId);
-    const color = ev.phase === 'ping' ? '#f39c12' : '#2ecc71'; // naranja=ping, verde=pong
     if (edge) {
       const origColor = edge.color;
       const origWidth = edge.width || 1;
-      edges.update({ id: edgeId, color: { color }, width: origWidth + 4 });
-      setTimeout(() => edges.update({ id: edgeId, color: origColor, width: origWidth }), 500);
-    } else {
-      // Sin arco directo: pulsar el nodo destino.
-      const targetId = ev.phase === 'ping' ? ev.to : ev.from;
-      const orig = originalAttrs.get(targetId);
-      if (orig) {
-        nodes.update({ id: targetId, color: { background: color, border: color }, size: orig.size + 8 });
-        setTimeout(() => nodes.update({ id: targetId, color: orig.color, size: orig.size }), 500);
-      }
+      edges.update({ id: edgeId, color: { color }, width: origWidth + 5 });
+      setTimeout(() => edges.update({ id: edgeId, color: origColor, width: origWidth }), DUR);
+    }
+
+    // Pulsar nodo receptor (siempre, con o sin arco).
+    const orig = originalAttrs.get(targetId);
+    if (orig) {
+      nodes.update({ id: targetId, color: { background: color, border: color }, size: orig.size + 12 });
+      setTimeout(() => nodes.update({ id: targetId, color: orig.color, size: orig.size }), DUR);
     }
   }
 
