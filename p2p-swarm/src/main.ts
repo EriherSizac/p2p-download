@@ -201,7 +201,9 @@ async function bootstrap(): Promise<void> {
         const myIdx   = msg.path.indexOf(peerId);
         const lastIdx = msg.path.length - 1;
         if (myIdx === lastIdx) {
-          cliPrint(`\n📩 [${shortId(msg.originId)} via ${msg.path.length - 1} salto(s)]: ${msg.text}`);
+          const hops = msg.path.length - 1;
+          cliPrint(`\n📩 [${shortId(msg.originId)} via ${hops} salto(s)]: ${msg.text}`);
+          graphServer?.msgReceived(msg.originId, msg.text, hops);
           break;
         }
         if (myIdx >= 0 && myIdx < lastIdx) {
@@ -258,6 +260,7 @@ async function bootstrap(): Promise<void> {
     return {
       nodes: visNodes, edges: visEdges,
       stats: { total, mutuals, oneway: edgeMap.size - mutuals, density: maxEdges > 0 ? (mutuals / maxEdges).toFixed(2) : '0.00', maxPeers: MAX_PEERS },
+      directPeers: transport.connectedPeers(),
       ts: Date.now(),
     };
   };
@@ -268,7 +271,33 @@ async function bootstrap(): Promise<void> {
   };
 
   const openGraph = async (): Promise<void> => {
-    if (!graphServer) { graphServer = new GraphServer(); await graphServer.start(); }
+    if (!graphServer) {
+      graphServer = new GraphServer();
+      await graphServer.start();
+      graphServer.setActions({
+        async sendMsg(targetId, text) {
+          const allKnown = gatherKnown(peerId, transport, peerLists);
+          const match = resolveId(targetId, allKnown);
+          if (!match) throw new Error(`peer desconocido: "${targetId}"`);
+          if (transport.isConnected(match)) {
+            transport.send(match, { type: MSG.DELIVER, searchId: newSearchId(), targetId: match, originId: peerId, text, path: [peerId, match] });
+            return;
+          }
+          const path = await startSearch(match);
+          const nextHop = path[1];
+          if (!nextHop || !transport.isConnected(nextHop)) throw new Error('ruta expiró');
+          transport.send(nextHop, { type: MSG.DELIVER, searchId: newSearchId(), targetId: match, originId: peerId, text, path });
+        },
+        async findPeer(targetId) {
+          const allKnown = gatherKnown(peerId, transport, peerLists);
+          const match = resolveId(targetId, allKnown);
+          if (!match) throw new Error(`peer desconocido: "${targetId}"`);
+          if (match === peerId) return [peerId];
+          if (transport.isConnected(match)) return [peerId, match];
+          return startSearch(match);
+        },
+      });
+    }
     graphServer.emit(buildSnapshot());
     const url = graphServer.url();
     cliPrint(`grafo: ${url}`);
