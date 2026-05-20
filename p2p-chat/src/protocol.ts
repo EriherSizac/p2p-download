@@ -1,6 +1,6 @@
 // File: CAPA 4 — PROTOCOLO (chat + llamadas A/V)
 // Created: 2026-05-13
-// Updated: 2026-05-13
+// Updated: 2026-05-19
 // Author: Erick Hernández Silva
 
 /**
@@ -81,8 +81,8 @@ export type Message =
   | { type: typeof MSG.CHAT; messageId: string; text: string; ts: number }
   | { type: typeof MSG.CHAT_ACK; messageId: string }
   | { type: typeof MSG.BYE }
-  | { type: typeof MSG.PING; nonce: number }
-  | { type: typeof MSG.PONG; nonce: number }
+  | { type: typeof MSG.PING; nonce: number; manual?: true }
+  | { type: typeof MSG.PONG; nonce: number; manual?: true }
   | { type: typeof MSG.PEER_LIST; peers: string[] }
   | { type: typeof MSG.CALL_OFFER; callId: string; sdp: string }
   | { type: typeof MSG.CALL_ANSWER; callId: string; sdp: string }

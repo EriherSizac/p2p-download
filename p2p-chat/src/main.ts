@@ -327,7 +327,7 @@ async function bootstrap(): Promise<void> {
         if (!liv) { liv = { pendingPings: new Map() }; liveness.set(to, liv); }
         const nonce = nextNonce++;
         liv.pendingPings.set(nonce, Date.now());
-        transport.send(to, { type: MSG.PING, nonce });
+        transport.send(to, { type: MSG.PING, nonce, manual: true });
         graphServer?.pingPulse(peerId, to, 'ping');
         return { ok: true };
       },
@@ -424,8 +424,9 @@ async function bootstrap(): Promise<void> {
       case MSG.PING:
         // Responder con PONG mismo nonce. NO añadimos timestamp aquí: el
         // RTT se mide en el lado que pingó (él sabe cuándo mandó cada nonce).
-        cliSinks.info?.(`⚡ ping de ${shortId(from)} → enviando pong`);
-        transport.send(from, { type: MSG.PONG, nonce: msg.nonce });
+        // Solo loguear/animar pings manuales; los automáticos (liveness) son silenciosos.
+        if (msg.manual) cliSinks.info?.(`⚡ ping de ${shortId(from)} → enviando pong`);
+        transport.send(from, { type: MSG.PONG, nonce: msg.nonce, ...(msg.manual && { manual: true }) });
         break;
 
       case MSG.PONG: {
@@ -459,8 +460,10 @@ async function bootstrap(): Promise<void> {
         liv.rttMs = liv.rttMs === undefined
           ? rtt
           : RTT_EWMA_ALPHA * rtt + (1 - RTT_EWMA_ALPHA) * liv.rttMs;
-        graphServer?.pingPulse(from, peerId, 'pong');
-        pushSnapshot(); // actualiza tooltip RTT
+        if (msg.manual) {
+          graphServer?.pingPulse(from, peerId, 'pong');
+          pushSnapshot(); // actualiza tooltip RTT
+        }
         break;
       }
 
