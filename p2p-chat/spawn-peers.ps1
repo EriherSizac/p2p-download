@@ -15,7 +15,8 @@
 param(
   [int]$Count    = 10,
   [int]$BasePort = 41237,
-  [switch]$FirewallOnly   # interno: solo crear reglas y salir
+  [switch]$Visible,        # muestra ventanas cmd (debug: ver logs de peers)
+  [switch]$FirewallOnly    # interno: solo crear reglas y salir
 )
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -91,10 +92,17 @@ for ($i = 0; $i -lt $Count; $i++) {
   Write-Host "  peer $($i+1)/$Count  TCP_PORT=$port  (delay ${delay}s)" -NoNewline
   Start-Sleep -Seconds $delay
 
+  # `echo n | ...` responde "n" al prompt del firewall en main.ts (askYesNo).
+  # Las reglas TCP ya las creo este script en paso 2; la regla UDP de node.exe
+  # solo importa para llamadas A/V - los peers headless de la swarm no llaman.
+  # En modo -Visible usamos `cmd /k` para que la ventana NO se cierre al salir
+  # tsx (asi puedes ver el error). Sin -Visible, Hidden + /c (cierra al acabar).
+  $cmdFlag = if ($Visible) { '/k' } else { '/c' }
+  $winStyle = if ($Visible) { 'Normal' } else { 'Hidden' }
   $p = Start-Process "cmd.exe" `
-    -ArgumentList "/c set TCP_PORT=$port && npx tsx src\main.ts" `
+    -ArgumentList "$cmdFlag set TCP_PORT=$port && echo n | npx tsx src\main.ts" `
     -WorkingDirectory $root `
-    -WindowStyle Hidden `
+    -WindowStyle $winStyle `
     -PassThru
 
   $processes.Add($p)
