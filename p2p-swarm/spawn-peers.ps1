@@ -122,7 +122,7 @@ for ($i = 0; $i -lt $Count; $i++) {
   $cmdFlag  = if ($Visible) { '/k' } else { '/c' }
   $winStyle = if ($Visible) { 'Normal' } else { 'Hidden' }
   $p = Start-Process "cmd.exe" `
-    -ArgumentList "$cmdFlag $envBlock && echo n | npx tsx src\main.ts" `
+    -ArgumentList "$cmdFlag $envBlock && npx tsx src\main.ts" `
     -WorkingDirectory $root `
     -WindowStyle $winStyle `
     -PassThru

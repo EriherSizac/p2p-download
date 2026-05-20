@@ -100,7 +100,7 @@ for ($i = 0; $i -lt $Count; $i++) {
   $cmdFlag = if ($Visible) { '/k' } else { '/c' }
   $winStyle = if ($Visible) { 'Normal' } else { 'Hidden' }
   $p = Start-Process "cmd.exe" `
-    -ArgumentList "$cmdFlag set TCP_PORT=$port && echo n | npx tsx src\main.ts" `
+    -ArgumentList "$cmdFlag set TCP_PORT=$port && npx tsx src\main.ts" `
     -WorkingDirectory $root `
     -WindowStyle $winStyle `
     -PassThru
